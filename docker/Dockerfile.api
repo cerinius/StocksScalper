@@ -1,0 +1,13 @@
+FROM node:20-alpine
+
+WORKDIR /app
+COPY package.json tsconfig.base.json ./
+COPY packages ./packages
+COPY apps/api ./apps/api
+
+RUN npm install
+RUN npm run prisma:generate -w packages/db
+RUN npm run build -w packages/core -w packages/db -w apps/api
+
+EXPOSE 3001
+CMD ["node", "apps/api/dist/index.js"]

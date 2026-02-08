@@ -1,0 +1,235 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SetupType {
+  breakout_retest
+  pullback_continuation
+  gap_and_go
+  reversal_major_level
+  relative_strength_leader
+  opening_range_breakout
+  vwap_reclaim
+  liquidity_sweep_reclaim
+}
+
+enum SetupTimeframe {
+  swing
+  scalp
+}
+
+enum SetupStatus {
+  watch
+  triggered
+  invalidated
+  expired
+}
+
+model Symbol {
+  id       String   @id @default(cuid())
+  ticker   String   @unique
+  name     String?
+  exchange String?
+  active   Boolean  @default(true)
+
+  dailyBars    DailyBar[]
+  intradayBars IntradayBar[]
+  newsItems    NewsItem[]
+  features     FeatureDaily[]
+  levels       LevelMap[]
+  setups       SetupCandidate[]
+  trades       TradeJournal[]
+  watchlistItems WatchlistItem[]
+}
+
+model UniverseSnapshot {
+  id           String                 @id @default(cuid())
+  snapshotDate DateTime
+  createdAt    DateTime               @default(now())
+  notes        String?
+  items        UniverseSnapshotItem[]
+}
+
+model Watchlist {
+  id        String         @id @default(cuid())
+  name      String
+  createdAt DateTime       @default(now())
+  notes     String?
+  items     WatchlistItem[]
+}
+
+model WatchlistItem {
+  id          String    @id @default(cuid())
+  watchlistId String
+  symbolId    String
+  createdAt   DateTime  @default(now())
+  notes       String?
+
+  watchlist Watchlist @relation(fields: [watchlistId], references: [id])
+  symbol    Symbol    @relation(fields: [symbolId], references: [id])
+
+  @@unique([watchlistId, symbolId])
+}
+
+model UniverseSnapshotItem {
+  id              String            @id @default(cuid())
+  snapshotId      String
+  symbolId        String
+  rank            Int
+  totalScore      Float
+  liquidityScore  Float
+  volatilityScore Float
+  volumeScore     Float
+  trendScore      Float
+  catalystScore   Float
+  metrics         Json
+
+  snapshot UniverseSnapshot @relation(fields: [snapshotId], references: [id])
+  symbol   Symbol           @relation(fields: [symbolId], references: [id])
+
+  @@index([snapshotId, rank])
+  @@index([symbolId])
+}
+
+model DailyBar {
+  id       String   @id @default(cuid())
+  symbolId String
+  date     DateTime
+  open     Float
+  high     Float
+  low      Float
+  close    Float
+  volume   Float
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+
+  @@unique([symbolId, date])
+  @@index([symbolId, date])
+}
+
+model IntradayBar {
+  id        String   @id @default(cuid())
+  symbolId  String
+  ts        DateTime
+  timeframe String
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    Float
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+
+  @@unique([symbolId, ts, timeframe])
+  @@index([symbolId, ts])
+}
+
+model NewsItem {
+  id          String   @id @default(cuid())
+  symbolId    String
+  publishedAt DateTime
+  headline    String
+  source      String
+  url         String
+  summary     String?
+  tags        Json?
+  sentiment   Float?
+  impactScore Float?
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+
+  @@unique([url, publishedAt])
+  @@index([symbolId, publishedAt])
+}
+
+model FeatureDaily {
+  id        String   @id @default(cuid())
+  symbolId  String
+  date      DateTime
+  atr14     Float
+  atrPct    Float
+  rvol      Float
+  sma20     Float
+  sma50     Float
+  sma200    Float
+  returns20 Float
+  returns60 Float
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+
+  @@unique([symbolId, date])
+  @@index([symbolId, date])
+}
+
+model LevelMap {
+  id        String   @id @default(cuid())
+  symbolId  String
+  date      DateTime
+  prevHigh  Float
+  prevLow   Float
+  prevClose Float
+  weekHigh  Float
+  weekLow   Float
+  gapLevels Json?
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+
+  @@unique([symbolId, date])
+  @@index([symbolId, date])
+}
+
+model SetupCandidate {
+  id                String        @id @default(cuid())
+  symbolId          String
+  createdAt         DateTime      @default(now())
+  setupType         SetupType
+  timeframe         SetupTimeframe
+  status            SetupStatus   @default(watch)
+  confidence        Float
+  trigger           Json
+  invalidation      Json
+  targets           Json
+  explanation       String
+  relatedSnapshotId String?
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+  events SetupEvent[]
+
+  @@index([symbolId, createdAt])
+}
+
+model SetupEvent {
+  id               String   @id @default(cuid())
+  setupCandidateId String
+  occurredAt       DateTime
+  eventType        String
+  payload          Json?
+
+  setupCandidate SetupCandidate @relation(fields: [setupCandidateId], references: [id])
+
+  @@index([setupCandidateId, occurredAt])
+}
+
+model TradeJournal {
+  id        String   @id @default(cuid())
+  symbolId  String
+  createdAt DateTime @default(now())
+  setupType SetupType
+  direction String
+  entry     Float
+  stop      Float
+  target    Float
+  exit      Float?
+  pnl       Float?
+  notes     String?
+  tags      Json?
+
+  symbol Symbol @relation(fields: [symbolId], references: [id])
+
+  @@index([symbolId, createdAt])
+}

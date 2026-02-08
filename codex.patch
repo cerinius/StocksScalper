@@ -1,0 +1,2514 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffa65e01a4723ae27caf6801b9d1b809e6d9f277
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,8 @@
++DATABASE_URL=postgresql://stockradar:stockradar@localhost:5432/stockradar
++REDIS_URL=redis://localhost:6379
++DATA_PROVIDER=mock
++POLYGON_API_KEY=
++NEWS_PROVIDER=mock
++WEBHOOK_SECRET=changeme
++MARKET_TIMEZONE=America/New_York
++NEXT_PUBLIC_API_BASE=http://localhost:3001
+diff --git a/.eslintrc.cjs b/.eslintrc.cjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b43b0c613365ad8481933c39b1ee6bf296314ab3
+--- /dev/null
++++ b/.eslintrc.cjs
+@@ -0,0 +1,10 @@
++module.exports = {
++  root: true,
++  env: { node: true, es2020: true },
++  extends: ["eslint:recommended"],
++  parserOptions: {
++    ecmaVersion: "latest",
++    sourceType: "module",
++  },
++  ignorePatterns: ["dist", "node_modules"],
++};
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9fe95ad2a826c39c0e728c19be28b25f8acec14
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++node_modules
++.next
++dist
++.env
++coverage
+diff --git a/.prettierrc b/.prettierrc
+new file mode 100644
+index 0000000000000000000000000000000000000000..59821061df89795cb296eedbf534730818686728
+--- /dev/null
++++ b/.prettierrc
+@@ -0,0 +1,4 @@
++{
++  "singleQuote": false,
++  "printWidth": 100
++}
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e04541686b3e7fdd982916ef5464ab9e723d86f
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,77 @@
++# Stock Radar
++
++US swing-first scanner with scalping support. Provides a Fastify API, BullMQ workers, and a Next.js dashboard.
++
++## Requirements
++
++- Node.js 20+
++- Docker + Docker Compose
++
++## Quick start (Docker)
++
++```bash
++cp .env.example .env
++npm install
++npm run prisma:generate -w packages/db
++npm run build -w packages/core -w packages/db -w apps/api -w apps/worker -w apps/web
++
++docker compose up --build
++```
++
++Visit:
++- API: http://localhost:3001
++- Docs: http://localhost:3001/docs
++- Web: http://localhost:3000
++
++## Local dev
++
++```bash
++npm install
++npm run prisma:generate -w packages/db
++npm run dev -w apps/api
++npm run dev -w apps/worker
++npm run dev -w apps/web
++```
++
++## Configuration
++
++Set these in `.env`:
++
++```
++DATABASE_URL=postgresql://stockradar:stockradar@localhost:5432/stockradar
++REDIS_URL=redis://localhost:6379
++DATA_PROVIDER=polygon|mock
++POLYGON_API_KEY=
++NEWS_PROVIDER=polygon|mock
++WEBHOOK_SECRET=changeme
++MARKET_TIMEZONE=America/New_York
++NEXT_PUBLIC_API_BASE=http://localhost:3001
++```
++
++## TradingView webhook
++
++POST `/api/tradingview/webhook` with header `x-webhook-secret`.
++
++Example payload:
++
++```json
++{
++  "symbol": "AAPL",
++  "eventType": "orb_break",
++  "payload": { "level": 188.5 }
++}
++```
++
++Sample Pine Script snippet:
++
++```pinescript
++//@version=5
++indicator("Stock Radar Alert", overlay=true)
++orbHigh = ta.highest(high, 5)
++orbBreak = ta.crossover(close, orbHigh)
++alertcondition(orbBreak, title="ORB Break", message="ORB breakout")
++```
++
++## Disclaimer
++
++This tool is for research/education. Not financial advice. Markets are risky.
+diff --git a/apps/api/package.json b/apps/api/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a9318071c735cdc7149452fd0343c386e3582ca
+--- /dev/null
++++ b/apps/api/package.json
+@@ -0,0 +1,27 @@
++{
++  "name": "@stock-radar/api",
++  "version": "0.1.0",
++  "private": true,
++  "main": "dist/index.js",
++  "scripts": {
++    "dev": "ts-node-dev --respawn src/index.ts",
++    "build": "tsc -p tsconfig.json",
++    "lint": "eslint .",
++    "test": "vitest"
++  },
++  "dependencies": {
++    "@fastify/cors": "^8.4.0",
++    "@fastify/helmet": "^11.1.1",
++    "@fastify/swagger": "^8.14.0",
++    "@fastify/swagger-ui": "^1.10.2",
++    "@stock-radar/core": "*",
++    "@stock-radar/db": "*",
++    "bullmq": "^5.6.0",
++    "fastify": "^4.28.1",
++    "zod": "^3.23.8"
++  },
++  "devDependencies": {
++    "@types/node": "^20.14.10",
++    "ts-node-dev": "^2.0.0"
++  }
++}
+diff --git a/apps/api/src/index.ts b/apps/api/src/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..671c9c9b9f19347b58a982d41e65390a92dc7283
+--- /dev/null
++++ b/apps/api/src/index.ts
+@@ -0,0 +1,42 @@
++import Fastify from "fastify";
++import cors from "@fastify/cors";
++import helmet from "@fastify/helmet";
++import swagger from "@fastify/swagger";
++import swaggerUi from "@fastify/swagger-ui";
++import { universeRoutes } from "./routes/universe";
++import { symbolRoutes } from "./routes/symbols";
++import { setupRoutes } from "./routes/setups";
++import { journalRoutes } from "./routes/journal";
++import { jobRoutes } from "./routes/jobs";
++import { tradingViewRoutes } from "./routes/tradingview";
++
++const app = Fastify({ logger: true });
++
++const start = async () => {
++  await app.register(cors, { origin: true });
++  await app.register(helmet);
++  await app.register(swagger, {
++    swagger: {
++      info: {
++        title: "Stock Radar API",
++        version: "0.1.0",
++      },
++    },
++  });
++  await app.register(swaggerUi, { routePrefix: "/docs" });
++
++  await app.register(universeRoutes);
++  await app.register(symbolRoutes);
++  await app.register(setupRoutes);
++  await app.register(journalRoutes);
++  await app.register(jobRoutes);
++  await app.register(tradingViewRoutes);
++
++  const port = Number(process.env.PORT ?? "3001");
++  await app.listen({ port, host: "0.0.0.0" });
++};
++
++start().catch((error) => {
++  app.log.error(error);
++  process.exit(1);
++});
+diff --git a/apps/api/src/routes/jobs.ts b/apps/api/src/routes/jobs.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..92fbe86d3a5498f33abfd401c2d00af01f9b6542
+--- /dev/null
++++ b/apps/api/src/routes/jobs.ts
+@@ -0,0 +1,19 @@
++import { FastifyInstance } from "fastify";
++import { dailyUpdateQueue, intradayScanQueue, weeklyRefreshQueue } from "../services/queues";
++
++export const jobRoutes = async (app: FastifyInstance) => {
++  app.post("/api/jobs/run-weekly-refresh", async () => {
++    const job = await weeklyRefreshQueue.add("weeklyUniverseRefresh", {});
++    return { queued: true, jobId: job.id };
++  });
++
++  app.post("/api/jobs/run-daily-update", async () => {
++    const job = await dailyUpdateQueue.add("dailyUpdate", {});
++    return { queued: true, jobId: job.id };
++  });
++
++  app.post("/api/jobs/run-intraday-scan", async () => {
++    const job = await intradayScanQueue.add("intradayScan", {});
++    return { queued: true, jobId: job.id };
++  });
++};
+diff --git a/apps/api/src/routes/journal.ts b/apps/api/src/routes/journal.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f772124754a79411f98afb5dd3a0c5f9d33da7d
+--- /dev/null
++++ b/apps/api/src/routes/journal.ts
+@@ -0,0 +1,53 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "@stock-radar/db";
++
++export const journalRoutes = async (app: FastifyInstance) => {
++  app.get("/api/journal", async () => {
++    return prisma.tradeJournal.findMany({ include: { symbol: true }, orderBy: { createdAt: "desc" } });
++  });
++
++  app.post("/api/journal", async (request) => {
++    const body = z
++      .object({
++        symbolId: z.string(),
++        setupType: z.string(),
++        direction: z.string(),
++        entry: z.number(),
++        stop: z.number(),
++        target: z.number(),
++        exit: z.number().optional(),
++        pnl: z.number().optional(),
++        notes: z.string().optional(),
++        tags: z.array(z.string()).optional(),
++      })
++      .parse(request.body);
++
++    return prisma.tradeJournal.create({
++      data: {
++        ...body,
++        tags: body.tags ?? undefined,
++      },
++    });
++  });
++
++  app.put("/api/journal/:id", async (request) => {
++    const params = z.object({ id: z.string() }).parse(request.params);
++    const body = z
++      .object({
++        entry: z.number().optional(),
++        stop: z.number().optional(),
++        target: z.number().optional(),
++        exit: z.number().optional(),
++        pnl: z.number().optional(),
++        notes: z.string().optional(),
++        tags: z.array(z.string()).optional(),
++      })
++      .parse(request.body);
++
++    return prisma.tradeJournal.update({
++      where: { id: params.id },
++      data: { ...body, tags: body.tags ?? undefined },
++    });
++  });
++};
+diff --git a/apps/api/src/routes/setups.ts b/apps/api/src/routes/setups.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1786e56013ca6659852187a524f839fa8c01edfe
+--- /dev/null
++++ b/apps/api/src/routes/setups.ts
+@@ -0,0 +1,37 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "@stock-radar/db";
++
++export const setupRoutes = async (app: FastifyInstance) => {
++  app.get("/api/setups", async (request) => {
++    const query = z
++      .object({ status: z.string().optional(), tf: z.string().optional() })
++      .parse(request.query);
++
++    return prisma.setupCandidate.findMany({
++      where: {
++        status: query.status ?? undefined,
++        timeframe: query.tf ?? undefined,
++      },
++      include: { symbol: true },
++      orderBy: { createdAt: "desc" },
++    });
++  });
++
++  app.get("/api/setups/:id", async (request) => {
++    const params = z.object({ id: z.string() }).parse(request.params);
++    return prisma.setupCandidate.findUnique({ where: { id: params.id }, include: { symbol: true } });
++  });
++
++  app.post("/api/setups/:id/status", async (request) => {
++    const params = z.object({ id: z.string() }).parse(request.params);
++    const body = z
++      .object({ status: z.enum(["watch", "triggered", "invalidated", "expired"]) })
++      .parse(request.body);
++
++    return prisma.setupCandidate.update({
++      where: { id: params.id },
++      data: { status: body.status },
++    });
++  });
++};
+diff --git a/apps/api/src/routes/symbols.ts b/apps/api/src/routes/symbols.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..504d661266815b9ff526f3a1856b57ea3942324f
+--- /dev/null
++++ b/apps/api/src/routes/symbols.ts
+@@ -0,0 +1,91 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "@stock-radar/db";
++
++export const symbolRoutes = async (app: FastifyInstance) => {
++  app.get("/api/symbols", async (request) => {
++    const query = z.object({ search: z.string().optional() }).parse(request.query);
++    return prisma.symbol.findMany({
++      where: query.search
++        ? {
++            OR: [
++              { ticker: { contains: query.search, mode: "insensitive" } },
++              { name: { contains: query.search, mode: "insensitive" } },
++            ],
++          }
++        : undefined,
++      orderBy: { ticker: "asc" },
++      take: 50,
++    });
++  });
++
++  app.get("/api/symbol/:ticker/summary", async (request) => {
++    const params = z.object({ ticker: z.string() }).parse(request.params);
++    const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
++    if (!symbol) return null;
++
++    const latestFeature = await prisma.featureDaily.findFirst({
++      where: { symbolId: symbol.id },
++      orderBy: { date: "desc" },
++    });
++    const latestLevel = await prisma.levelMap.findFirst({
++      where: { symbolId: symbol.id },
++      orderBy: { date: "desc" },
++    });
++    return { symbol, latestFeature, latestLevel };
++  });
++
++  app.get("/api/symbol/:ticker/daily", async (request) => {
++    const params = z.object({ ticker: z.string() }).parse(request.params);
++    const query = z.object({ from: z.string().optional(), to: z.string().optional() }).parse(request.query);
++    const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
++    if (!symbol) return [];
++
++    return prisma.dailyBar.findMany({
++      where: {
++        symbolId: symbol.id,
++        date: {
++          gte: query.from ? new Date(query.from) : undefined,
++          lte: query.to ? new Date(query.to) : undefined,
++        },
++      },
++      orderBy: { date: "asc" },
++    });
++  });
++
++  app.get("/api/symbol/:ticker/intraday", async (request) => {
++    const params = z.object({ ticker: z.string() }).parse(request.params);
++    const query = z
++      .object({ tf: z.string().default("5m"), from: z.string().optional(), to: z.string().optional() })
++      .parse(request.query);
++    const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
++    if (!symbol) return [];
++
++    return prisma.intradayBar.findMany({
++      where: {
++        symbolId: symbol.id,
++        timeframe: query.tf,
++        ts: {
++          gte: query.from ? new Date(query.from) : undefined,
++          lte: query.to ? new Date(query.to) : undefined,
++        },
++      },
++      orderBy: { ts: "asc" },
++    });
++  });
++
++  app.get("/api/symbol/:ticker/news", async (request) => {
++    const params = z.object({ ticker: z.string() }).parse(request.params);
++    const query = z.object({ days: z.string().optional() }).parse(request.query);
++    const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
++    if (!symbol) return [];
++
++    const days = Number(query.days ?? "7");
++    const since = new Date(Date.now() - days * 86_400_000);
++
++    return prisma.newsItem.findMany({
++      where: { symbolId: symbol.id, publishedAt: { gte: since } },
++      orderBy: { publishedAt: "desc" },
++    });
++  });
++};
+diff --git a/apps/api/src/routes/tradingview.ts b/apps/api/src/routes/tradingview.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e3a7eee4d25f9331eb5725154a73265545b54f2
+--- /dev/null
++++ b/apps/api/src/routes/tradingview.ts
+@@ -0,0 +1,48 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "@stock-radar/db";
++
++export const tradingViewRoutes = async (app: FastifyInstance) => {
++  app.post("/api/tradingview/webhook", async (request, reply) => {
++    const secret = request.headers["x-webhook-secret"] as string | undefined;
++    if (!secret || secret !== process.env.WEBHOOK_SECRET) {
++      reply.status(401);
++      return { error: "Unauthorized" };
++    }
++
++    const body = z
++      .object({
++        symbol: z.string(),
++        eventType: z.string(),
++        payload: z.record(z.unknown()).optional(),
++      })
++      .parse(request.body);
++
++    const symbol = await prisma.symbol.findUnique({ where: { ticker: body.symbol } });
++    if (!symbol) {
++      reply.status(404);
++      return { error: "Symbol not found" };
++    }
++
++    const candidate = await prisma.setupCandidate.findFirst({
++      where: { symbolId: symbol.id },
++      orderBy: { createdAt: "desc" },
++    });
++
++    if (!candidate) {
++      reply.status(400);
++      return { error: "No setup candidate to attach" };
++    }
++
++    const event = await prisma.setupEvent.create({
++      data: {
++        setupCandidateId: candidate.id,
++        occurredAt: new Date(),
++        eventType: body.eventType,
++        payload: body.payload ?? {},
++      },
++    });
++
++    return { stored: true, eventId: event.id };
++  });
++};
+diff --git a/apps/api/src/routes/universe.ts b/apps/api/src/routes/universe.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a1c46c52ce5042b587bc2f220a06737ac1232b7
+--- /dev/null
++++ b/apps/api/src/routes/universe.ts
+@@ -0,0 +1,38 @@
++import { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "@stock-radar/db";
++
++export const universeRoutes = async (app: FastifyInstance) => {
++  app.get("/api/universe/current", async () => {
++    const latest = await prisma.universeSnapshot.findFirst({
++      orderBy: { snapshotDate: "desc" },
++      include: { items: { include: { symbol: true }, orderBy: { rank: "asc" } } },
++    });
++    return latest ?? { items: [] };
++  });
++
++  app.get("/api/universe/:date", async (request) => {
++    const params = z.object({ date: z.string() }).parse(request.params);
++    const snapshotDate = new Date(params.date);
++    return prisma.universeSnapshot.findFirst({
++      where: { snapshotDate },
++      include: { items: { include: { symbol: true }, orderBy: { rank: "asc" } } },
++    });
++  });
++
++  app.get("/api/universe/history", async (request) => {
++    const query = z.object({ symbol: z.string().optional() }).parse(request.query);
++    if (!query.symbol) {
++      return prisma.universeSnapshot.findMany({ orderBy: { snapshotDate: "desc" } });
++    }
++
++    const symbol = await prisma.symbol.findUnique({ where: { ticker: query.symbol } });
++    if (!symbol) return [];
++
++    return prisma.universeSnapshotItem.findMany({
++      where: { symbolId: symbol.id },
++      include: { snapshot: true },
++      orderBy: { snapshot: { snapshotDate: "desc" } },
++    });
++  });
++};
+diff --git a/apps/api/src/services/providers.ts b/apps/api/src/services/providers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f83ad70fe19df1caa7f22ddd5e8450e2877fbbeb
+--- /dev/null
++++ b/apps/api/src/services/providers.ts
+@@ -0,0 +1,27 @@
++import { MockMarketDataProvider, MockNewsProvider } from "@stock-radar/core";
++import type { MarketDataProvider, NewsProvider } from "@stock-radar/core";
++
++export interface ProviderBundle {
++  market: MarketDataProvider;
++  news: NewsProvider;
++}
++
++export const createProviders = (): ProviderBundle => {
++  const marketProvider = process.env.DATA_PROVIDER ?? "mock";
++  const newsProvider = process.env.NEWS_PROVIDER ?? "mock";
++
++  if (marketProvider !== "mock") {
++    // Placeholder for Polygon or other providers.
++    // TODO: implement real provider adapter.
++  }
++
++  if (newsProvider !== "mock") {
++    // Placeholder for Polygon or other providers.
++    // TODO: implement real provider adapter.
++  }
++
++  return {
++    market: new MockMarketDataProvider(),
++    news: new MockNewsProvider(),
++  };
++};
+diff --git a/apps/api/src/services/queues.ts b/apps/api/src/services/queues.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f78880ea6a502125b4de8ab96680ff4b7810442
+--- /dev/null
++++ b/apps/api/src/services/queues.ts
+@@ -0,0 +1,11 @@
++import { Queue } from "bullmq";
++
++const connection = {
++  connection: {
++    url: process.env.REDIS_URL ?? "redis://localhost:6379",
++  },
++};
++
++export const weeklyRefreshQueue = new Queue("weeklyRefreshQueue", connection);
++export const dailyUpdateQueue = new Queue("dailyUpdateQueue", connection);
++export const intradayScanQueue = new Queue("intradayScanQueue", connection);
+diff --git a/apps/api/tsconfig.json b/apps/api/tsconfig.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5285d28af22ae3cc360d5d619a0aee65645c0571
+--- /dev/null
++++ b/apps/api/tsconfig.json
+@@ -0,0 +1,8 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "rootDir": "src",
++    "outDir": "dist"
++  },
++  "include": ["src"]
++}
+diff --git a/apps/web/next-env.d.ts b/apps/web/next-env.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..84ab714bdef68903103f153806cfe168ecbb94f8
+--- /dev/null
++++ b/apps/web/next-env.d.ts
+@@ -0,0 +1,4 @@
++/// <reference types="next" />
++/// <reference types="next/image-types/global" />
++
++// NOTE: This file should not be edited
+diff --git a/apps/web/next.config.js b/apps/web/next.config.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..91ef62f0db592e919ce8f1cb31148f185bc4611e
+--- /dev/null
++++ b/apps/web/next.config.js
+@@ -0,0 +1,6 @@
++/** @type {import('next').NextConfig} */
++const nextConfig = {
++  reactStrictMode: true,
++};
++
++module.exports = nextConfig;
+diff --git a/apps/web/package.json b/apps/web/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..aeb63f3b09f8dd81d2d73651040df226a51c5b66
+--- /dev/null
++++ b/apps/web/package.json
+@@ -0,0 +1,23 @@
++{
++  "name": "@stock-radar/web",
++  "version": "0.1.0",
++  "private": true,
++  "scripts": {
++    "dev": "next dev -p 3000",
++    "build": "next build",
++    "lint": "next lint",
++    "test": "vitest"
++  },
++  "dependencies": {
++    "next": "^14.2.5",
++    "react": "^18.3.1",
++    "react-dom": "^18.3.1",
++    "swr": "^2.2.5"
++  },
++  "devDependencies": {
++    "@types/node": "^20.14.10",
++    "@types/react": "^18.3.3",
++    "@types/react-dom": "^18.3.0",
++    "typescript": "^5.6.3"
++  }
++}
+diff --git a/apps/web/src/app/globals.css b/apps/web/src/app/globals.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..c146d5da54a9844b33d07ca38e4795dc0bed4808
+--- /dev/null
++++ b/apps/web/src/app/globals.css
+@@ -0,0 +1,80 @@
++:root {
++  color-scheme: light;
++  font-family: "Inter", system-ui, sans-serif;
++  background: #f6f7fb;
++  color: #1f2430;
++}
++
++body {
++  margin: 0;
++  padding: 0;
++}
++
++main {
++  max-width: 1200px;
++  margin: 0 auto;
++  padding: 32px 20px 64px;
++}
++
++header {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  padding: 20px 20px 0;
++}
++
++nav a {
++  margin-right: 16px;
++  text-decoration: none;
++  color: #4250ff;
++  font-weight: 600;
++}
++
++section {
++  background: #fff;
++  border-radius: 12px;
++  padding: 20px;
++  box-shadow: 0 6px 18px rgba(15, 20, 34, 0.08);
++  margin-bottom: 20px;
++}
++
++.card-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
++  gap: 16px;
++}
++
++.card {
++  border: 1px solid #e6e8ef;
++  border-radius: 10px;
++  padding: 16px;
++}
++
++.table {
++  width: 100%;
++  border-collapse: collapse;
++}
++
++.table th,
++.table td {
++  text-align: left;
++  padding: 10px 8px;
++  border-bottom: 1px solid #eceff6;
++}
++
++.badge {
++  display: inline-block;
++  padding: 4px 10px;
++  border-radius: 999px;
++  background: #eef1ff;
++  color: #4250ff;
++  font-size: 12px;
++  font-weight: 600;
++}
++
++.footer {
++  text-align: center;
++  font-size: 12px;
++  color: #6c7385;
++  padding: 40px 0 20px;
++}
+diff --git a/apps/web/src/app/journal/page.tsx b/apps/web/src/app/journal/page.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c82362868b8932b53bdb7a37a29b7c950c45fa2d
+--- /dev/null
++++ b/apps/web/src/app/journal/page.tsx
+@@ -0,0 +1,41 @@
++const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
++
++const fetchJson = async (path: string) => {
++  const res = await fetch(`${apiBase}${path}`, { next: { revalidate: 10 } });
++  if (!res.ok) return [];
++  return res.json();
++};
++
++export default async function JournalPage() {
++  const entries = await fetchJson("/api/journal");
++
++  return (
++    <section>
++      <h2>Trade Journal</h2>
++      <table className="table">
++        <thead>
++          <tr>
++            <th>Symbol</th>
++            <th>Setup</th>
++            <th>Entry</th>
++            <th>Stop</th>
++            <th>Target</th>
++            <th>PNL</th>
++          </tr>
++        </thead>
++        <tbody>
++          {entries.map((entry: any) => (
++            <tr key={entry.id}>
++              <td>{entry.symbol?.ticker}</td>
++              <td>{entry.setupType}</td>
++              <td>{entry.entry}</td>
++              <td>{entry.stop}</td>
++              <td>{entry.target}</td>
++              <td>{entry.pnl ?? "-"}</td>
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </section>
++  );
++}
+diff --git a/apps/web/src/app/layout.tsx b/apps/web/src/app/layout.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f86676ceb5b6356e045a45a097fcbc99e9b7c33
+--- /dev/null
++++ b/apps/web/src/app/layout.tsx
+@@ -0,0 +1,35 @@
++import "./globals.css";
++import Link from "next/link";
++
++export const metadata = {
++  title: "Stock Radar",
++  description: "US swing-first scanner with scalping support",
++};
++
++export default function RootLayout({
++  children,
++}: {
++  children: React.ReactNode;
++}) {
++  return (
++    <html lang="en">
++      <body>
++        <header>
++          <div>
++            <h1>Stock Radar</h1>
++            <p>US swing-first scanner + scalping support</p>
++          </div>
++          <nav>
++            <Link href="/">Home</Link>
++            <Link href="/setups">Setups</Link>
++            <Link href="/journal">Journal</Link>
++          </nav>
++        </header>
++        <main>{children}</main>
++        <div className="footer">
++          This tool is for research/education. Not financial advice. Markets are risky.
++        </div>
++      </body>
++    </html>
++  );
++}
+diff --git a/apps/web/src/app/page.tsx b/apps/web/src/app/page.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..2470ce70184a1e224ae206f62222b928238ccd19
+--- /dev/null
++++ b/apps/web/src/app/page.tsx
+@@ -0,0 +1,57 @@
++const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
++
++const fetchJson = async (path: string) => {
++  const res = await fetch(`${apiBase}${path}`, { next: { revalidate: 10 } });
++  if (!res.ok) return null;
++  return res.json();
++};
++
++export default async function HomePage() {
++  const universe = await fetchJson("/api/universe/current");
++  const items = universe?.items ?? [];
++
++  return (
++    <>
++      <section>
++        <h2>Current Top 100</h2>
++        <p>Weekly ranked universe with liquidity, volatility, and catalyst scoring.</p>
++        <table className="table">
++          <thead>
++            <tr>
++              <th>Rank</th>
++              <th>Ticker</th>
++              <th>Total Score</th>
++              <th>Dollar Vol</th>
++              <th>ATR%</th>
++            </tr>
++          </thead>
++          <tbody>
++            {items.map((item: any) => (
++              <tr key={item.id}>
++                <td>{item.rank}</td>
++                <td>{item.symbol?.ticker}</td>
++                <td>{item.totalScore.toFixed(1)}</td>
++                <td>${(item.metrics?.dollarVolume ?? 0).toLocaleString()}</td>
++                <td>{(item.metrics?.atrPct ?? 0).toFixed(2)}%</td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </section>
++
++      <section>
++        <h2>In-play Today</h2>
++        <div className="card-grid">
++          {items.slice(0, 4).map((item: any) => (
++            <div className="card" key={`inplay-${item.id}`}>
++              <div className="badge">{item.symbol?.ticker}</div>
++              <h3>Score {item.totalScore.toFixed(1)}</h3>
++              <p>RVOL {item.metrics?.rvol?.toFixed?.(2) ?? "-"}</p>
++              <p>Trend {item.metrics?.trendScore?.toFixed?.(2) ?? "-"}</p>
++            </div>
++          ))}
++        </div>
++      </section>
++    </>
++  );
++}
+diff --git a/apps/web/src/app/setups/page.tsx b/apps/web/src/app/setups/page.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fb31286bff4e0f92e3fa1869eeee7dde8fd6eb4
+--- /dev/null
++++ b/apps/web/src/app/setups/page.tsx
+@@ -0,0 +1,64 @@
++const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
++
++const fetchJson = async (path: string) => {
++  const res = await fetch(`${apiBase}${path}`, { next: { revalidate: 10 } });
++  if (!res.ok) return [];
++  return res.json();
++};
++
++export default async function SetupsPage() {
++  const swing = await fetchJson("/api/setups?status=watch&tf=swing");
++  const scalp = await fetchJson("/api/setups?status=watch&tf=scalp");
++
++  return (
++    <>
++      <section>
++        <h2>Swing Setups</h2>
++        <table className="table">
++          <thead>
++            <tr>
++              <th>Symbol</th>
++              <th>Type</th>
++              <th>Confidence</th>
++              <th>Status</th>
++            </tr>
++          </thead>
++          <tbody>
++            {swing.map((item: any) => (
++              <tr key={item.id}>
++                <td>{item.symbol?.ticker}</td>
++                <td>{item.setupType}</td>
++                <td>{item.confidence}</td>
++                <td>{item.status}</td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </section>
++
++      <section>
++        <h2>Scalp Setups</h2>
++        <table className="table">
++          <thead>
++            <tr>
++              <th>Symbol</th>
++              <th>Type</th>
++              <th>Confidence</th>
++              <th>Status</th>
++            </tr>
++          </thead>
++          <tbody>
++            {scalp.map((item: any) => (
++              <tr key={item.id}>
++                <td>{item.symbol?.ticker}</td>
++                <td>{item.setupType}</td>
++                <td>{item.confidence}</td>
++                <td>{item.status}</td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </section>
++    </>
++  );
++}
+diff --git a/apps/web/src/app/symbols/[ticker]/page.tsx b/apps/web/src/app/symbols/[ticker]/page.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8aff2bc87c8d5dedc10898205235755b22b677a8
+--- /dev/null
++++ b/apps/web/src/app/symbols/[ticker]/page.tsx
+@@ -0,0 +1,74 @@
++interface SymbolPageProps {
++  params: { ticker: string };
++}
++
++const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
++
++const fetchJson = async (path: string) => {
++  const res = await fetch(`${apiBase}${path}`, { next: { revalidate: 10 } });
++  if (!res.ok) return null;
++  return res.json();
++};
++
++export default async function SymbolPage({ params }: SymbolPageProps) {
++  const summary = await fetchJson(`/api/symbol/${params.ticker}/summary`);
++  const news = await fetchJson(`/api/symbol/${params.ticker}/news?days=7`);
++  const setups = await fetchJson(`/api/setups?status=watch`);
++
++  return (
++    <>
++      <section>
++        <h2>{params.ticker} Overview</h2>
++        <div className="card-grid">
++          <div className="card">
++            <h3>ATR%</h3>
++            <p>{summary?.latestFeature?.atrPct ?? "-"}</p>
++          </div>
++          <div className="card">
++            <h3>RVOL</h3>
++            <p>{summary?.latestFeature?.rvol ?? "-"}</p>
++          </div>
++          <div className="card">
++            <h3>Weekly High</h3>
++            <p>{summary?.latestLevel?.weekHigh ?? "-"}</p>
++          </div>
++        </div>
++      </section>
++
++      <section>
++        <h2>News</h2>
++        <ul>
++          {news?.map((item: any) => (
++            <li key={item.id}>
++              <strong>{item.headline}</strong> - {item.source}
++            </li>
++          ))}
++        </ul>
++      </section>
++
++      <section>
++        <h2>Setup Candidates</h2>
++        <table className="table">
++          <thead>
++            <tr>
++              <th>Type</th>
++              <th>Timeframe</th>
++              <th>Confidence</th>
++            </tr>
++          </thead>
++          <tbody>
++            {setups
++              ?.filter((item: any) => item.symbol?.ticker === params.ticker)
++              .map((item: any) => (
++                <tr key={item.id}>
++                  <td>{item.setupType}</td>
++                  <td>{item.timeframe}</td>
++                  <td>{item.confidence}</td>
++                </tr>
++              ))}
++          </tbody>
++        </table>
++      </section>
++    </>
++  );
++}
+diff --git a/apps/web/tsconfig.json b/apps/web/tsconfig.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..a572bf8284742a4c23a708b83369ad39c51ce58a
+--- /dev/null
++++ b/apps/web/tsconfig.json
+@@ -0,0 +1,13 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "jsx": "preserve",
++    "module": "ESNext",
++    "moduleResolution": "Bundler",
++    "allowJs": true,
++    "noEmit": true,
++    "incremental": true
++  },
++  "include": ["next-env.d.ts", "src/**/*"],
++  "exclude": ["node_modules"]
++}
+diff --git a/apps/worker/package.json b/apps/worker/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5c31667bbbad91e69b466ea71a234632001edab
+--- /dev/null
++++ b/apps/worker/package.json
+@@ -0,0 +1,22 @@
++{
++  "name": "@stock-radar/worker",
++  "version": "0.1.0",
++  "private": true,
++  "main": "dist/index.js",
++  "scripts": {
++    "dev": "ts-node-dev --respawn src/index.ts",
++    "build": "tsc -p tsconfig.json",
++    "lint": "eslint .",
++    "test": "vitest"
++  },
++  "dependencies": {
++    "@stock-radar/core": "*",
++    "@stock-radar/db": "*",
++    "bullmq": "^5.6.0",
++    "zod": "^3.23.8"
++  },
++  "devDependencies": {
++    "@types/node": "^20.14.10",
++    "ts-node-dev": "^2.0.0"
++  }
++}
+diff --git a/apps/worker/src/index.ts b/apps/worker/src/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c051d750613a4e713253bd83cee8d5d0faa1518
+--- /dev/null
++++ b/apps/worker/src/index.ts
+@@ -0,0 +1,47 @@
++import { Worker } from "bullmq";
++import { weeklyUniverseRefresh } from "./jobs/weeklyUniverseRefresh";
++import { dailyUpdate } from "./jobs/dailyUpdate";
++import { intradayScan } from "./jobs/intradayScan";
++
++const connection = {
++  connection: {
++    url: process.env.REDIS_URL ?? "redis://localhost:6379",
++  },
++};
++
++const weeklyWorker = new Worker(
++  "weeklyRefreshQueue",
++  async () => {
++    await weeklyUniverseRefresh();
++  },
++  connection,
++);
++
++const dailyWorker = new Worker(
++  "dailyUpdateQueue",
++  async () => {
++    await dailyUpdate();
++  },
++  connection,
++);
++
++const intradayWorker = new Worker(
++  "intradayScanQueue",
++  async () => {
++    await intradayScan();
++  },
++  connection,
++);
++
++const workers = [weeklyWorker, dailyWorker, intradayWorker];
++
++workers.forEach((worker) => {
++  worker.on("completed", (job) => {
++    // eslint-disable-next-line no-console
++    console.log(`Job ${job.id} completed on ${worker.name}`);
++  });
++  worker.on("failed", (job, err) => {
++    // eslint-disable-next-line no-console
++    console.error(`Job ${job?.id} failed on ${worker.name}`, err);
++  });
++});
+diff --git a/apps/worker/src/jobs/dailyUpdate.ts b/apps/worker/src/jobs/dailyUpdate.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5381f7b1cbac351643e08a6d5848ef49b22a5cd
+--- /dev/null
++++ b/apps/worker/src/jobs/dailyUpdate.ts
+@@ -0,0 +1,140 @@
++import { MockMarketDataProvider, MockNewsProvider } from "@stock-radar/core";
++import { detectSwingSetups } from "@stock-radar/core";
++import { prisma } from "@stock-radar/db";
++
++const market = new MockMarketDataProvider();
++const newsProvider = new MockNewsProvider();
++
++export const dailyUpdate = async () => {
++  const latestSnapshot = await prisma.universeSnapshot.findFirst({
++    orderBy: { snapshotDate: "desc" },
++    include: { items: { include: { symbol: true } } },
++  });
++
++  if (!latestSnapshot) return { updated: 0 };
++
++  for (const item of latestSnapshot.items) {
++    const bars = await market.getDailyBars(item.symbol.ticker, 60);
++    const [latest, prev] = bars;
++    if (!latest || !prev) continue;
++
++    await prisma.dailyBar.upsert({
++      where: { symbolId_date: { symbolId: item.symbolId, date: new Date(latest.date) } },
++      update: {
++        open: latest.open,
++        high: latest.high,
++        low: latest.low,
++        close: latest.close,
++        volume: latest.volume,
++      },
++      create: {
++        symbolId: item.symbolId,
++        date: new Date(latest.date),
++        open: latest.open,
++        high: latest.high,
++        low: latest.low,
++        close: latest.close,
++        volume: latest.volume,
++      },
++    });
++
++    await prisma.featureDaily.upsert({
++      where: { symbolId_date: { symbolId: item.symbolId, date: new Date(latest.date) } },
++      update: {
++        atr14: 2,
++        atrPct: 2.5,
++        rvol: 1.2,
++        sma20: latest.close * 0.98,
++        sma50: latest.close * 0.95,
++        sma200: latest.close * 0.9,
++        returns20: 0.1,
++        returns60: 0.2,
++      },
++      create: {
++        symbolId: item.symbolId,
++        date: new Date(latest.date),
++        atr14: 2,
++        atrPct: 2.5,
++        rvol: 1.2,
++        sma20: latest.close * 0.98,
++        sma50: latest.close * 0.95,
++        sma200: latest.close * 0.9,
++        returns20: 0.1,
++        returns60: 0.2,
++      },
++    });
++
++    await prisma.levelMap.upsert({
++      where: { symbolId_date: { symbolId: item.symbolId, date: new Date(latest.date) } },
++      update: {
++        prevHigh: prev.high,
++        prevLow: prev.low,
++        prevClose: prev.close,
++        weekHigh: Math.max(...bars.slice(0, 5).map((bar) => bar.high)),
++        weekLow: Math.min(...bars.slice(0, 5).map((bar) => bar.low)),
++      },
++      create: {
++        symbolId: item.symbolId,
++        date: new Date(latest.date),
++        prevHigh: prev.high,
++        prevLow: prev.low,
++        prevClose: prev.close,
++        weekHigh: Math.max(...bars.slice(0, 5).map((bar) => bar.high)),
++        weekLow: Math.min(...bars.slice(0, 5).map((bar) => bar.low)),
++      },
++    });
++
++    const news = await newsProvider.getNews(item.symbol.ticker, 7);
++    for (const newsItem of news) {
++      await prisma.newsItem.upsert({
++        where: { url_publishedAt: { url: newsItem.url, publishedAt: new Date(newsItem.publishedAt) } },
++        update: {
++          headline: newsItem.headline,
++          source: newsItem.source,
++          summary: newsItem.summary,
++          tags: newsItem.tags,
++        },
++        create: {
++          symbolId: item.symbolId,
++          publishedAt: new Date(newsItem.publishedAt),
++          headline: newsItem.headline,
++          source: newsItem.source,
++          url: newsItem.url,
++          summary: newsItem.summary,
++          tags: newsItem.tags,
++        },
++      });
++    }
++
++    const setups = detectSwingSetups({
++      symbol: item.symbol.ticker,
++      bars,
++      news,
++      levels: {
++        prevHigh: prev.high,
++        prevLow: prev.low,
++        weekHigh: Math.max(...bars.slice(0, 5).map((bar) => bar.high)),
++        weekLow: Math.min(...bars.slice(0, 5).map((bar) => bar.low)),
++      },
++    });
++
++    for (const setup of setups) {
++      await prisma.setupCandidate.create({
++        data: {
++          symbolId: item.symbolId,
++          setupType: setup.setupType,
++          timeframe: setup.timeframe,
++          status: "watch",
++          confidence: setup.confidence,
++          trigger: setup.trigger,
++          invalidation: setup.invalidation,
++          targets: setup.targets,
++          explanation: setup.explanation,
++          relatedSnapshotId: latestSnapshot.id,
++        },
++      });
++    }
++  }
++
++  return { updated: latestSnapshot.items.length };
++};
+diff --git a/apps/worker/src/jobs/intradayScan.ts b/apps/worker/src/jobs/intradayScan.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa2391add034fe5c5d77ea928f8cd1aac1fcf6d8
+--- /dev/null
++++ b/apps/worker/src/jobs/intradayScan.ts
+@@ -0,0 +1,75 @@
++import { MockMarketDataProvider } from "@stock-radar/core";
++import { detectScalpSetups } from "@stock-radar/core";
++import { prisma } from "@stock-radar/db";
++
++const market = new MockMarketDataProvider();
++
++export const intradayScan = async () => {
++  const latestSnapshot = await prisma.universeSnapshot.findFirst({
++    orderBy: { snapshotDate: "desc" },
++    include: { items: { include: { symbol: true } } },
++  });
++
++  if (!latestSnapshot) return { scanned: 0 };
++
++  for (const item of latestSnapshot.items) {
++    const bars = await market.getIntradayBars(item.symbol.ticker, "5m", 5);
++    const [latest] = bars;
++    if (!latest) continue;
++
++    await prisma.intradayBar.upsert({
++      where: {
++        symbolId_ts_timeframe: {
++          symbolId: item.symbolId,
++          ts: new Date(latest.date),
++          timeframe: "5m",
++        },
++      },
++      update: {
++        open: latest.open,
++        high: latest.high,
++        low: latest.low,
++        close: latest.close,
++        volume: latest.volume,
++      },
++      create: {
++        symbolId: item.symbolId,
++        ts: new Date(latest.date),
++        timeframe: "5m",
++        open: latest.open,
++        high: latest.high,
++        low: latest.low,
++        close: latest.close,
++        volume: latest.volume,
++      },
++    });
++
++    const setups = detectScalpSetups({
++      symbol: item.symbol.ticker,
++      bars,
++      vwap: latest.close * 0.99,
++      openingRangeHigh: latest.high * 0.98,
++      openingRangeLow: latest.low * 1.02,
++      yesterdayHigh: latest.high * 0.97,
++      yesterdayLow: latest.low * 1.01,
++    });
++
++    for (const setup of setups) {
++      await prisma.setupCandidate.create({
++        data: {
++          symbolId: item.symbolId,
++          setupType: setup.setupType,
++          timeframe: setup.timeframe,
++          status: "watch",
++          confidence: setup.confidence,
++          trigger: setup.trigger,
++          invalidation: setup.invalidation,
++          targets: setup.targets,
++          explanation: setup.explanation,
++        },
++      });
++    }
++  }
++
++  return { scanned: latestSnapshot.items.length };
++};
+diff --git a/apps/worker/src/jobs/weeklyUniverseRefresh.ts b/apps/worker/src/jobs/weeklyUniverseRefresh.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..88bac3aa69fac4cdc1737edde8ad631ef872512d
+--- /dev/null
++++ b/apps/worker/src/jobs/weeklyUniverseRefresh.ts
+@@ -0,0 +1,61 @@
++import { prisma } from "@stock-radar/db";
++import { MockMarketDataProvider } from "@stock-radar/core";
++import { scoreUniverse } from "@stock-radar/core";
++
++const weights = {
++  liquidity: 35,
++  volatility: 25,
++  volume: 20,
++  trend: 10,
++  catalyst: 10,
++};
++
++export const weeklyUniverseRefresh = async () => {
++  const provider = new MockMarketDataProvider();
++  const candidates = await provider.getUniverse();
++
++  const filtered = candidates.filter(
++    (candidate) =>
++      candidate.metrics.price >= 5 &&
++      candidate.metrics.price <= 500 &&
++      candidate.metrics.dollarVolume >= 50_000_000 &&
++      candidate.metrics.avgVolume >= 2_000_000 &&
++      candidate.metrics.atrPct >= 2,
++  );
++
++  const scored = scoreUniverse(filtered, weights)
++    .sort((a, b) => b.totalScore - a.totalScore)
++    .slice(0, 100);
++
++  const snapshot = await prisma.universeSnapshot.create({
++    data: {
++      snapshotDate: new Date(),
++      notes: "Weekly universe refresh",
++    },
++  });
++
++  for (const [idx, item] of scored.entries()) {
++    const symbol = await prisma.symbol.upsert({
++      where: { ticker: item.symbol },
++      update: {},
++      create: { ticker: item.symbol, name: item.symbol, exchange: "NASDAQ" },
++    });
++
++    await prisma.universeSnapshotItem.create({
++      data: {
++        snapshotId: snapshot.id,
++        symbolId: symbol.id,
++        rank: idx + 1,
++        totalScore: item.totalScore,
++        liquidityScore: item.components.liquidityScore,
++        volatilityScore: item.components.volatilityScore,
++        volumeScore: item.components.volumeScore,
++        trendScore: item.components.trendScore,
++        catalystScore: item.components.catalystScore,
++        metrics: item.metrics,
++      },
++    });
++  }
++
++  return { snapshotId: snapshot.id, total: scored.length };
++};
+diff --git a/apps/worker/tsconfig.json b/apps/worker/tsconfig.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5285d28af22ae3cc360d5d619a0aee65645c0571
+--- /dev/null
++++ b/apps/worker/tsconfig.json
+@@ -0,0 +1,8 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "rootDir": "src",
++    "outDir": "dist"
++  },
++  "include": ["src"]
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..a04900318030fce1fc43903b5010d7cf0f245de7
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,61 @@
++version: "3.9"
++
++services:
++  postgres:
++    image: postgres:15
++    environment:
++      POSTGRES_USER: stockradar
++      POSTGRES_PASSWORD: stockradar
++      POSTGRES_DB: stockradar
++    ports:
++      - "5432:5432"
++    volumes:
++      - pgdata:/var/lib/postgresql/data
++
++  redis:
++    image: redis:7
++    ports:
++      - "6379:6379"
++
++  api:
++    build:
++      context: .
++      dockerfile: docker/Dockerfile.api
++    environment:
++      DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
++      REDIS_URL: redis://redis:6379
++      DATA_PROVIDER: mock
++      NEWS_PROVIDER: mock
++      WEBHOOK_SECRET: local-dev-secret
++    ports:
++      - "3001:3001"
++    depends_on:
++      - postgres
++      - redis
++
++  worker:
++    build:
++      context: .
++      dockerfile: docker/Dockerfile.worker
++    environment:
++      DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
++      REDIS_URL: redis://redis:6379
++      DATA_PROVIDER: mock
++      NEWS_PROVIDER: mock
++    depends_on:
++      - postgres
++      - redis
++
++  web:
++    build:
++      context: .
++      dockerfile: docker/Dockerfile.web
++    environment:
++      NEXT_PUBLIC_API_BASE: http://localhost:3001
++    ports:
++      - "3000:3000"
++    depends_on:
++      - api
++
++volumes:
++  pgdata:
+diff --git a/docker/Dockerfile.api b/docker/Dockerfile.api
+new file mode 100644
+index 0000000000000000000000000000000000000000..af56a0da48c1902bd1ab61164ce3751a0cd33b68
+--- /dev/null
++++ b/docker/Dockerfile.api
+@@ -0,0 +1,13 @@
++FROM node:20-alpine
++
++WORKDIR /app
++COPY package.json tsconfig.base.json ./
++COPY packages ./packages
++COPY apps/api ./apps/api
++
++RUN npm install
++RUN npm run prisma:generate -w packages/db
++RUN npm run build -w packages/core -w packages/db -w apps/api
++
++EXPOSE 3001
++CMD ["node", "apps/api/dist/index.js"]
+diff --git a/docker/Dockerfile.web b/docker/Dockerfile.web
+new file mode 100644
+index 0000000000000000000000000000000000000000..cec0421dcbbfc0304d972167b25ff38094d9d30b
+--- /dev/null
++++ b/docker/Dockerfile.web
+@@ -0,0 +1,11 @@
++FROM node:20-alpine
++
++WORKDIR /app
++COPY package.json tsconfig.base.json ./
++COPY apps/web ./apps/web
++
++RUN npm install
++RUN npm run build -w apps/web
++
++EXPOSE 3000
++CMD ["npm", "run", "dev", "-w", "apps/web", "--", "-p", "3000"]
+diff --git a/docker/Dockerfile.worker b/docker/Dockerfile.worker
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c4cb3ef18eaa0205007856e6eae84b6a2214aed
+--- /dev/null
++++ b/docker/Dockerfile.worker
+@@ -0,0 +1,12 @@
++FROM node:20-alpine
++
++WORKDIR /app
++COPY package.json tsconfig.base.json ./
++COPY packages ./packages
++COPY apps/worker ./apps/worker
++
++RUN npm install
++RUN npm run prisma:generate -w packages/db
++RUN npm run build -w packages/core -w packages/db -w apps/worker
++
++CMD ["node", "apps/worker/dist/index.js"]
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7be0edba3891cd84545e344ba2b68bc5d1b4e92c
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,21 @@
++{
++  "name": "stock-radar",
++  "private": true,
++  "workspaces": [
++    "apps/*",
++    "packages/*"
++  ],
++  "scripts": {
++    "dev": "npm run dev -w apps/api & npm run dev -w apps/worker & npm run dev -w apps/web",
++    "build": "npm run build -ws",
++    "lint": "npm run lint -ws",
++    "test": "npm run test -ws",
++    "format": "prettier -w ."
++  },
++  "devDependencies": {
++    "eslint": "^8.57.0",
++    "prettier": "^3.3.3",
++    "typescript": "^5.6.3",
++    "vitest": "^1.6.0"
++  }
++}
+diff --git a/packages/core/package.json b/packages/core/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f1c3f951bfdc9ef7d3683ed19ff21a699d43f61
+--- /dev/null
++++ b/packages/core/package.json
+@@ -0,0 +1,17 @@
++{
++  "name": "@stock-radar/core",
++  "version": "0.1.0",
++  "main": "dist/index.js",
++  "types": "dist/index.d.ts",
++  "scripts": {
++    "build": "tsc -p tsconfig.json",
++    "lint": "eslint .",
++    "test": "vitest"
++  },
++  "dependencies": {
++    "zod": "^3.23.8"
++  },
++  "devDependencies": {
++    "@types/node": "^20.14.10"
++  }
++}
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..473a5e29f0e6b0800eaea5a8259682140e4150d3
+--- /dev/null
++++ b/packages/core/src/index.ts
+@@ -0,0 +1,5 @@
++export * from "./types";
++export * from "./providers";
++export * from "./scoring/normalize";
++export * from "./setups/swing";
++export * from "./setups/scalp";
+diff --git a/packages/core/src/providers/index.ts b/packages/core/src/providers/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..aaffe870b0bc6f54c8b737f8b1b60233e36d2fd0
+--- /dev/null
++++ b/packages/core/src/providers/index.ts
+@@ -0,0 +1,3 @@
++export * from "./market-data";
++export * from "./news";
++export * from "./mock";
+diff --git a/packages/core/src/providers/market-data.ts b/packages/core/src/providers/market-data.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e71829307f5fda72930558ea2a5b55693cc8ff55
+--- /dev/null
++++ b/packages/core/src/providers/market-data.ts
+@@ -0,0 +1,7 @@
++import type { DailyBar, UniverseCandidate } from "../types";
++
++export interface MarketDataProvider {
++  getUniverse(): Promise<UniverseCandidate[]>;
++  getDailyBars(symbol: string, days: number): Promise<DailyBar[]>;
++  getIntradayBars(symbol: string, timeframe: "1m" | "5m", days: number): Promise<DailyBar[]>;
++}
+diff --git a/packages/core/src/providers/mock.test.ts b/packages/core/src/providers/mock.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..33b683304738cce662e21b523761c5063b7267e2
+--- /dev/null
++++ b/packages/core/src/providers/mock.test.ts
+@@ -0,0 +1,15 @@
++import { describe, expect, it } from "vitest";
++import { MockMarketDataProvider, MockNewsProvider } from "./mock";
++
++describe("mock providers", () => {
++  it("returns universe and news", async () => {
++    const market = new MockMarketDataProvider();
++    const news = new MockNewsProvider();
++
++    const universe = await market.getUniverse();
++    const items = await news.getNews("AAPL", 3);
++
++    expect(universe.length).toBeGreaterThan(0);
++    expect(items[0].symbol).toBe("AAPL");
++  });
++});
+diff --git a/packages/core/src/providers/mock.ts b/packages/core/src/providers/mock.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..81427c33fd68af0bbbca1706c3774ecdf0688e2c
+--- /dev/null
++++ b/packages/core/src/providers/mock.ts
+@@ -0,0 +1,57 @@
++import type { DailyBar, NewsItem, UniverseCandidate } from "../types";
++import type { MarketDataProvider } from "./market-data";
++import type { NewsProvider } from "./news";
++
++const sampleSymbols = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "AMD", "NFLX"];
++
++const makeBars = (days: number): DailyBar[] =>
++  Array.from({ length: days }).map((_, idx) => {
++    const base = 100 + idx * 0.3;
++    return {
++      date: new Date(Date.now() - idx * 86_400_000).toISOString().slice(0, 10),
++      open: base,
++      high: base * 1.02,
++      low: base * 0.98,
++      close: base * 1.01,
++      volume: 2_500_000 + idx * 10_000,
++    };
++  });
++
++export class MockMarketDataProvider implements MarketDataProvider {
++  async getUniverse(): Promise<UniverseCandidate[]> {
++    return sampleSymbols.map((symbol, idx) => ({
++      symbol,
++      metrics: {
++        price: 50 + idx * 10,
++        dollarVolume: 80_000_000 + idx * 5_000_000,
++        avgVolume: 3_000_000 + idx * 100_000,
++        atrPct: 2.5 + idx * 0.1,
++        rvol: 1.2 + idx * 0.05,
++        trendScore: 0.6 + idx * 0.02,
++        catalystScore: 0.4 + idx * 0.03,
++      },
++    }));
++  }
++
++  async getDailyBars(_symbol: string, days: number): Promise<DailyBar[]> {
++    return makeBars(days);
++  }
++
++  async getIntradayBars(_symbol: string, _timeframe: "1m" | "5m", days: number): Promise<DailyBar[]> {
++    return makeBars(days);
++  }
++}
++
++export class MockNewsProvider implements NewsProvider {
++  async getNews(symbol: string, days: number): Promise<NewsItem[]> {
++    return Array.from({ length: Math.min(days, 3) }).map((_, idx) => ({
++      symbol,
++      publishedAt: new Date(Date.now() - idx * 86_400_000).toISOString(),
++      headline: `${symbol} catalyst update ${idx + 1}`,
++      source: "MockWire",
++      url: `https://example.com/${symbol}/${idx}`,
++      summary: "Mock news item for offline development.",
++      tags: ["earnings", "guidance"].slice(0, idx + 1),
++    }));
++  }
++}
+diff --git a/packages/core/src/providers/news.ts b/packages/core/src/providers/news.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dbc01abc301c106b7027d654357ddb4cd28cfe8
+--- /dev/null
++++ b/packages/core/src/providers/news.ts
+@@ -0,0 +1,5 @@
++import type { NewsItem } from "../types";
++
++export interface NewsProvider {
++  getNews(symbol: string, days: number): Promise<NewsItem[]>;
++}
+diff --git a/packages/core/src/scoring/normalize.test.ts b/packages/core/src/scoring/normalize.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d3cebe5d8d9e175a5ebb60901bc9ba396dac3d7
+--- /dev/null
++++ b/packages/core/src/scoring/normalize.test.ts
+@@ -0,0 +1,43 @@
++import { describe, expect, it } from "vitest";
++import { scoreUniverse } from "./normalize";
++
++const sample = [
++  {
++    symbol: "AAA",
++    metrics: {
++      price: 10,
++      dollarVolume: 100,
++      avgVolume: 10,
++      atrPct: 2,
++      rvol: 1,
++      trendScore: 0.5,
++      catalystScore: 0.2,
++    },
++  },
++  {
++    symbol: "BBB",
++    metrics: {
++      price: 20,
++      dollarVolume: 200,
++      avgVolume: 20,
++      atrPct: 4,
++      rvol: 2,
++      trendScore: 0.8,
++      catalystScore: 0.5,
++    },
++  },
++];
++
++describe("scoreUniverse", () => {
++  it("normalizes and scores candidates", () => {
++    const scored = scoreUniverse(sample, {
++      liquidity: 35,
++      volatility: 25,
++      volume: 20,
++      trend: 10,
++      catalyst: 10,
++    });
++    expect(scored).toHaveLength(2);
++    expect(scored[1].totalScore).toBeGreaterThan(scored[0].totalScore);
++  });
++});
+diff --git a/packages/core/src/scoring/normalize.ts b/packages/core/src/scoring/normalize.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..40377ae93f9f437f91aca0bdacdf5720e07e7677
+--- /dev/null
++++ b/packages/core/src/scoring/normalize.ts
+@@ -0,0 +1,62 @@
++import type { ScoredCandidate, ScoreWeights, UniverseCandidate } from "../types";
++
++export const winsorize = (values: number[], lowerPct = 0.05, upperPct = 0.95): number[] => {
++  if (values.length === 0) return [];
++  const sorted = [...values].sort((a, b) => a - b);
++  const lowerIdx = Math.floor(lowerPct * (sorted.length - 1));
++  const upperIdx = Math.ceil(upperPct * (sorted.length - 1));
++  const lower = sorted[lowerIdx];
++  const upper = sorted[upperIdx];
++  return values.map((value) => Math.min(Math.max(value, lower), upper));
++};
++
++export const minMaxNormalize = (values: number[]): number[] => {
++  const min = Math.min(...values);
++  const max = Math.max(...values);
++  if (min === max) return values.map(() => 0.5);
++  return values.map((value) => (value - min) / (max - min));
++};
++
++export const scoreUniverse = (
++  candidates: UniverseCandidate[],
++  weights: ScoreWeights,
++): ScoredCandidate[] => {
++  const liquidity = winsorize(candidates.map((c) => c.metrics.dollarVolume));
++  const volatility = winsorize(candidates.map((c) => c.metrics.atrPct));
++  const volume = winsorize(candidates.map((c) => c.metrics.rvol));
++  const trend = winsorize(candidates.map((c) => c.metrics.trendScore));
++  const catalyst = winsorize(candidates.map((c) => c.metrics.catalystScore));
++
++  const normLiquidity = minMaxNormalize(liquidity);
++  const normVolatility = minMaxNormalize(volatility);
++  const normVolume = minMaxNormalize(volume);
++  const normTrend = minMaxNormalize(trend);
++  const normCatalyst = minMaxNormalize(catalyst);
++
++  const totalWeight =
++    weights.liquidity + weights.volatility + weights.volume + weights.trend + weights.catalyst;
++
++  return candidates.map((candidate, idx) => {
++    const liquidityScore = normLiquidity[idx] * weights.liquidity;
++    const volatilityScore = normVolatility[idx] * weights.volatility;
++    const volumeScore = normVolume[idx] * weights.volume;
++    const trendScore = normTrend[idx] * weights.trend;
++    const catalystScore = normCatalyst[idx] * weights.catalyst;
++    const totalScore =
++      ((liquidityScore + volatilityScore + volumeScore + trendScore + catalystScore) / totalWeight) *
++      100;
++
++    return {
++      symbol: candidate.symbol,
++      totalScore,
++      components: {
++        liquidityScore,
++        volatilityScore,
++        volumeScore,
++        trendScore,
++        catalystScore,
++      },
++      metrics: candidate.metrics,
++    };
++  });
++};
+diff --git a/packages/core/src/setups/scalp.ts b/packages/core/src/setups/scalp.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e022235293cf602520124e29b96deb0221ab2904
+--- /dev/null
++++ b/packages/core/src/setups/scalp.ts
+@@ -0,0 +1,72 @@
++import type { DailyBar, SetupCandidate } from "../types";
++
++interface ScalpContext {
++  symbol: string;
++  bars: DailyBar[];
++  vwap: number;
++  openingRangeHigh: number;
++  openingRangeLow: number;
++  yesterdayHigh: number;
++  yesterdayLow: number;
++}
++
++const baseCandidate = (symbol: string, setupType: SetupCandidate["setupType"]): SetupCandidate => ({
++  symbol,
++  setupType,
++  timeframe: "scalp",
++  confidence: 50,
++  trigger: {},
++  invalidation: {},
++  targets: {},
++  explanation: "",
++});
++
++export const detectOpeningRangeBreakout = (context: ScalpContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.close <= context.openingRangeHigh) return null;
++  return {
++    ...baseCandidate(context.symbol, "opening_range_breakout"),
++    confidence: 73,
++    trigger: { level: context.openingRangeHigh, note: "Break OR high with RVOL." },
++    invalidation: { level: context.openingRangeLow, note: "Fail back into OR." },
++    targets: { atrMultiple: 0.8 },
++    explanation: "Opening range breakout with volume expansion.",
++  };
++};
++
++export const detectVwapReclaim = (context: ScalpContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.close <= context.vwap) return null;
++  return {
++    ...baseCandidate(context.symbol, "vwap_reclaim"),
++    confidence: 66,
++    trigger: { level: context.vwap, note: "Reclaim and hold VWAP." },
++    invalidation: { level: context.vwap * 0.99, note: "Lose VWAP." },
++    targets: { atrMultiple: 0.6 },
++    explanation: "VWAP reclaim with momentum.",
++  };
++};
++
++export const detectLiquiditySweepReclaim = (context: ScalpContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.low >= context.yesterdayLow) return null;
++  return {
++    ...baseCandidate(context.symbol, "liquidity_sweep_reclaim"),
++    confidence: 60,
++    trigger: { level: context.yesterdayLow, note: "Reclaim sweep low." },
++    invalidation: { level: context.yesterdayLow * 0.995, note: "Lose sweep reclaim." },
++    targets: { atrMultiple: 0.7 },
++    explanation: "Liquidity sweep below yesterday low then reclaim.",
++  };
++};
++
++export const detectScalpSetups = (context: ScalpContext): SetupCandidate[] => {
++  return [
++    detectOpeningRangeBreakout(context),
++    detectVwapReclaim(context),
++    detectLiquiditySweepReclaim(context),
++  ].filter((item): item is SetupCandidate => Boolean(item));
++};
+diff --git a/packages/core/src/setups/setups.test.ts b/packages/core/src/setups/setups.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa77a50c198e9d323479e8deacc4573bed8d40b1
+--- /dev/null
++++ b/packages/core/src/setups/setups.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, it } from "vitest";
++import { detectSwingSetups } from "./swing";
++import { detectScalpSetups } from "./scalp";
++
++const bars = [
++  { date: "2024-01-02", open: 100, high: 110, low: 95, close: 108, volume: 1000000 },
++  { date: "2024-01-01", open: 98, high: 105, low: 94, close: 100, volume: 900000 },
++];
++
++describe("setup detectors", () => {
++  it("detects swing setups", () => {
++    const setups = detectSwingSetups({
++      symbol: "TEST",
++      bars,
++      news: [{
++        symbol: "TEST",
++        publishedAt: new Date().toISOString(),
++        headline: "Test",
++        source: "Mock",
++        url: "https://example.com",
++      }],
++      levels: {
++        prevHigh: 105,
++        prevLow: 94,
++        weekHigh: 104,
++        weekLow: 90,
++      },
++    });
++
++    expect(setups.length).toBeGreaterThan(0);
++  });
++
++  it("detects scalp setups", () => {
++    const setups = detectScalpSetups({
++      symbol: "TEST",
++      bars,
++      vwap: 100,
++      openingRangeHigh: 103,
++      openingRangeLow: 97,
++      yesterdayHigh: 104,
++      yesterdayLow: 96,
++    });
++
++    expect(setups.length).toBeGreaterThan(0);
++  });
++});
+diff --git a/packages/core/src/setups/swing.ts b/packages/core/src/setups/swing.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf41099eb0dc133630c791ba5d77b8935729e7da
+--- /dev/null
++++ b/packages/core/src/setups/swing.ts
+@@ -0,0 +1,102 @@
++import type { DailyBar, NewsItem, SetupCandidate } from "../types";
++
++interface SwingContext {
++  symbol: string;
++  bars: DailyBar[];
++  news: NewsItem[];
++  levels: {
++    prevHigh: number;
++    prevLow: number;
++    weekHigh: number;
++    weekLow: number;
++  };
++}
++
++const baseCandidate = (symbol: string, setupType: SetupCandidate["setupType"]): SetupCandidate => ({
++  symbol,
++  setupType,
++  timeframe: "swing",
++  confidence: 50,
++  trigger: {},
++  invalidation: {},
++  targets: {},
++  explanation: "",
++});
++
++export const detectBreakoutRetest = (context: SwingContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.close <= context.levels.weekHigh) return null;
++  return {
++    ...baseCandidate(context.symbol, "breakout_retest"),
++    confidence: 72,
++    trigger: { level: context.levels.weekHigh, note: "Hold above breakout level." },
++    invalidation: { level: context.levels.prevLow, note: "Break below prior support." },
++    targets: { atrMultiple: 2 },
++    explanation: "Break above multi-week resistance with room to retest on lighter volume.",
++  };
++};
++
++export const detectPullbackContinuation = (context: SwingContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.close < context.levels.prevLow) return null;
++  return {
++    ...baseCandidate(context.symbol, "pullback_continuation"),
++    confidence: 68,
++    trigger: { level: context.levels.prevHigh, note: "Reclaim prior swing high." },
++    invalidation: { level: context.levels.prevLow, note: "Lose pullback support." },
++    targets: { atrMultiple: 1.5 },
++    explanation: "Uptrend pullback holding prior support with contraction.",
++  };
++};
++
++export const detectGapAndGo = (context: SwingContext): SetupCandidate | null => {
++  if (context.news.length === 0) return null;
++  return {
++    ...baseCandidate(context.symbol, "gap_and_go"),
++    confidence: 65,
++    trigger: { level: context.levels.prevHigh, note: "Hold gap midpoint and push." },
++    invalidation: { level: context.levels.prevLow, note: "Gap fails below midpoint." },
++    targets: { atrMultiple: 2.2 },
++    explanation: "Catalyst-backed gap holding key levels.",
++  };
++};
++
++export const detectReversalMajorLevel = (context: SwingContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.low >= context.levels.weekLow) return null;
++  return {
++    ...baseCandidate(context.symbol, "reversal_major_level"),
++    confidence: 62,
++    trigger: { level: context.levels.weekLow, note: "Reclaim major low." },
++    invalidation: { level: context.levels.weekLow * 0.98, note: "Lose reclaimed level." },
++    targets: { atrMultiple: 2.5 },
++    explanation: "Liquidity sweep below support with close strength.",
++  };
++};
++
++export const detectRelativeStrengthLeader = (context: SwingContext): SetupCandidate | null => {
++  const latest = context.bars[0];
++  if (!latest) return null;
++  if (latest.close <= context.levels.prevHigh) return null;
++  return {
++    ...baseCandidate(context.symbol, "relative_strength_leader"),
++    confidence: 70,
++    trigger: { level: context.levels.prevHigh, note: "Break from consolidation." },
++    invalidation: { level: context.levels.prevLow, note: "Lose relative strength base." },
++    targets: { atrMultiple: 1.8 },
++    explanation: "Relative strength leader breaking above consolidation.",
++  };
++};
++
++export const detectSwingSetups = (context: SwingContext): SetupCandidate[] => {
++  return [
++    detectBreakoutRetest(context),
++    detectPullbackContinuation(context),
++    detectGapAndGo(context),
++    detectReversalMajorLevel(context),
++    detectRelativeStrengthLeader(context),
++  ].filter((item): item is SetupCandidate => Boolean(item));
++};
+diff --git a/packages/core/src/types.ts b/packages/core/src/types.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6122304df273825cc1f47cf255564576cf268895
+--- /dev/null
++++ b/packages/core/src/types.ts
+@@ -0,0 +1,84 @@
++export type Timeframe = "swing" | "scalp";
++
++export type SetupType =
++  | "breakout_retest"
++  | "pullback_continuation"
++  | "gap_and_go"
++  | "reversal_major_level"
++  | "relative_strength_leader"
++  | "opening_range_breakout"
++  | "vwap_reclaim"
++  | "liquidity_sweep_reclaim";
++
++export type SetupStatus = "watch" | "triggered" | "invalidated" | "expired";
++
++export interface SymbolQuote {
++  symbol: string;
++  price: number;
++  volume: number;
++  dollarVolume: number;
++}
++
++export interface DailyBar {
++  date: string;
++  open: number;
++  high: number;
++  low: number;
++  close: number;
++  volume: number;
++}
++
++export interface NewsItem {
++  symbol: string;
++  publishedAt: string;
++  headline: string;
++  source: string;
++  url: string;
++  summary?: string;
++  tags?: string[];
++}
++
++export interface UniverseCandidate {
++  symbol: string;
++  metrics: {
++    price: number;
++    dollarVolume: number;
++    avgVolume: number;
++    atrPct: number;
++    rvol: number;
++    trendScore: number;
++    catalystScore: number;
++  };
++}
++
++export interface ScoreWeights {
++  liquidity: number;
++  volatility: number;
++  volume: number;
++  trend: number;
++  catalyst: number;
++}
++
++export interface ScoredCandidate {
++  symbol: string;
++  totalScore: number;
++  components: {
++    liquidityScore: number;
++    volatilityScore: number;
++    volumeScore: number;
++    trendScore: number;
++    catalystScore: number;
++  };
++  metrics: UniverseCandidate["metrics"];
++}
++
++export interface SetupCandidate {
++  symbol: string;
++  setupType: SetupType;
++  timeframe: Timeframe;
++  confidence: number;
++  trigger: Record<string, unknown>;
++  invalidation: Record<string, unknown>;
++  targets: Record<string, unknown>;
++  explanation: string;
++}
+diff --git a/packages/core/tsconfig.json b/packages/core/tsconfig.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5285d28af22ae3cc360d5d619a0aee65645c0571
+--- /dev/null
++++ b/packages/core/tsconfig.json
+@@ -0,0 +1,8 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "rootDir": "src",
++    "outDir": "dist"
++  },
++  "include": ["src"]
++}
+diff --git a/packages/db/package.json b/packages/db/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9d7fd9217290e9fd36e43197c44fcc20e69aa9e
+--- /dev/null
++++ b/packages/db/package.json
+@@ -0,0 +1,19 @@
++{
++  "name": "@stock-radar/db",
++  "version": "0.1.0",
++  "main": "dist/index.js",
++  "types": "dist/index.d.ts",
++  "scripts": {
++    "build": "tsc -p tsconfig.json",
++    "lint": "eslint .",
++    "test": "vitest",
++    "prisma:generate": "prisma generate"
++  },
++  "dependencies": {
++    "@prisma/client": "^5.18.0"
++  },
++  "devDependencies": {
++    "prisma": "^5.18.0",
++    "@types/node": "^20.14.10"
++  }
++}
+diff --git a/packages/db/prisma/schema.prisma b/packages/db/prisma/schema.prisma
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee11d87c55733f3e1f95c11fdd92ad5c42c38798
+--- /dev/null
++++ b/packages/db/prisma/schema.prisma
+@@ -0,0 +1,235 @@
++generator client {
++  provider = "prisma-client-js"
++}
++
++datasource db {
++  provider = "postgresql"
++  url      = env("DATABASE_URL")
++}
++
++enum SetupType {
++  breakout_retest
++  pullback_continuation
++  gap_and_go
++  reversal_major_level
++  relative_strength_leader
++  opening_range_breakout
++  vwap_reclaim
++  liquidity_sweep_reclaim
++}
++
++enum SetupTimeframe {
++  swing
++  scalp
++}
++
++enum SetupStatus {
++  watch
++  triggered
++  invalidated
++  expired
++}
++
++model Symbol {
++  id       String   @id @default(cuid())
++  ticker   String   @unique
++  name     String?
++  exchange String?
++  active   Boolean  @default(true)
++
++  dailyBars    DailyBar[]
++  intradayBars IntradayBar[]
++  newsItems    NewsItem[]
++  features     FeatureDaily[]
++  levels       LevelMap[]
++  setups       SetupCandidate[]
++  trades       TradeJournal[]
++  watchlistItems WatchlistItem[]
++}
++
++model UniverseSnapshot {
++  id           String                 @id @default(cuid())
++  snapshotDate DateTime
++  createdAt    DateTime               @default(now())
++  notes        String?
++  items        UniverseSnapshotItem[]
++}
++
++model Watchlist {
++  id        String         @id @default(cuid())
++  name      String
++  createdAt DateTime       @default(now())
++  notes     String?
++  items     WatchlistItem[]
++}
++
++model WatchlistItem {
++  id          String    @id @default(cuid())
++  watchlistId String
++  symbolId    String
++  createdAt   DateTime  @default(now())
++  notes       String?
++
++  watchlist Watchlist @relation(fields: [watchlistId], references: [id])
++  symbol    Symbol    @relation(fields: [symbolId], references: [id])
++
++  @@unique([watchlistId, symbolId])
++}
++
++model UniverseSnapshotItem {
++  id              String            @id @default(cuid())
++  snapshotId      String
++  symbolId        String
++  rank            Int
++  totalScore      Float
++  liquidityScore  Float
++  volatilityScore Float
++  volumeScore     Float
++  trendScore      Float
++  catalystScore   Float
++  metrics         Json
++
++  snapshot UniverseSnapshot @relation(fields: [snapshotId], references: [id])
++  symbol   Symbol           @relation(fields: [symbolId], references: [id])
++
++  @@index([snapshotId, rank])
++  @@index([symbolId])
++}
++
++model DailyBar {
++  id       String   @id @default(cuid())
++  symbolId String
++  date     DateTime
++  open     Float
++  high     Float
++  low      Float
++  close    Float
++  volume   Float
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++
++  @@unique([symbolId, date])
++  @@index([symbolId, date])
++}
++
++model IntradayBar {
++  id        String   @id @default(cuid())
++  symbolId  String
++  ts        DateTime
++  timeframe String
++  open      Float
++  high      Float
++  low       Float
++  close     Float
++  volume    Float
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++
++  @@unique([symbolId, ts, timeframe])
++  @@index([symbolId, ts])
++}
++
++model NewsItem {
++  id          String   @id @default(cuid())
++  symbolId    String
++  publishedAt DateTime
++  headline    String
++  source      String
++  url         String
++  summary     String?
++  tags        Json?
++  sentiment   Float?
++  impactScore Float?
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++
++  @@unique([url, publishedAt])
++  @@index([symbolId, publishedAt])
++}
++
++model FeatureDaily {
++  id        String   @id @default(cuid())
++  symbolId  String
++  date      DateTime
++  atr14     Float
++  atrPct    Float
++  rvol      Float
++  sma20     Float
++  sma50     Float
++  sma200    Float
++  returns20 Float
++  returns60 Float
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++
++  @@unique([symbolId, date])
++  @@index([symbolId, date])
++}
++
++model LevelMap {
++  id        String   @id @default(cuid())
++  symbolId  String
++  date      DateTime
++  prevHigh  Float
++  prevLow   Float
++  prevClose Float
++  weekHigh  Float
++  weekLow   Float
++  gapLevels Json?
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++
++  @@unique([symbolId, date])
++  @@index([symbolId, date])
++}
++
++model SetupCandidate {
++  id                String        @id @default(cuid())
++  symbolId          String
++  createdAt         DateTime      @default(now())
++  setupType         SetupType
++  timeframe         SetupTimeframe
++  status            SetupStatus   @default(watch)
++  confidence        Float
++  trigger           Json
++  invalidation      Json
++  targets           Json
++  explanation       String
++  relatedSnapshotId String?
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++  events SetupEvent[]
++
++  @@index([symbolId, createdAt])
++}
++
++model SetupEvent {
++  id               String   @id @default(cuid())
++  setupCandidateId String
++  occurredAt       DateTime
++  eventType        String
++  payload          Json?
++
++  setupCandidate SetupCandidate @relation(fields: [setupCandidateId], references: [id])
++
++  @@index([setupCandidateId, occurredAt])
++}
++
++model TradeJournal {
++  id        String   @id @default(cuid())
++  symbolId  String
++  createdAt DateTime @default(now())
++  setupType SetupType
++  direction String
++  entry     Float
++  stop      Float
++  target    Float
++  exit      Float?
++  pnl       Float?
++  notes     String?
++  tags      Json?
++
++  symbol Symbol @relation(fields: [symbolId], references: [id])
++
++  @@index([symbolId, createdAt])
++}
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..901f3a0d96c85f03c817b7e9892530a044a520b9
+--- /dev/null
++++ b/packages/db/src/index.ts
+@@ -0,0 +1,3 @@
++import { PrismaClient } from "@prisma/client";
++
++export const prisma = new PrismaClient();
+diff --git a/packages/db/tsconfig.json b/packages/db/tsconfig.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5285d28af22ae3cc360d5d619a0aee65645c0571
+--- /dev/null
++++ b/packages/db/tsconfig.json
+@@ -0,0 +1,8 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "rootDir": "src",
++    "outDir": "dist"
++  },
++  "include": ["src"]
++}
+diff --git a/tsconfig.base.json b/tsconfig.base.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..37d11ef4e1728820cf871ca3198743b4785dbc10
+--- /dev/null
++++ b/tsconfig.base.json
+@@ -0,0 +1,14 @@
++{
++  "compilerOptions": {
++    "target": "ES2020",
++    "lib": ["ES2020"],
++    "module": "CommonJS",
++    "moduleResolution": "Node",
++    "strict": true,
++    "esModuleInterop": true,
++    "forceConsistentCasingInFileNames": true,
++    "skipLibCheck": true,
++    "declaration": true,
++    "outDir": "dist"
++  }
++}
