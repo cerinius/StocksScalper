@@ -1,13 +1,30 @@
-const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
+const apiBase = process.env.API_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
+export const dynamic = "force-dynamic";
 
-const fetchJson = async (path: string) => {
-  const res = await fetch(`${apiBase}${path}`, { next: { revalidate: 10 } });
-  if (!res.ok) return [];
-  return res.json();
+interface JournalEntry {
+  id: string;
+  setupType: string;
+  entry: number;
+  stop: number;
+  target: number;
+  pnl: number | null;
+  symbol?: {
+    ticker?: string;
+  };
+}
+
+const fetchJson = async <T,>(path: string, fallback: T): Promise<T> => {
+  try {
+    const res = await fetch(`${apiBase}${path}`);
+    if (!res.ok) return fallback;
+    return (await res.json()) as T;
+  } catch {
+    return fallback;
+  }
 };
 
 export default async function JournalPage() {
-  const entries = await fetchJson("/api/journal");
+  const entries = await fetchJson<JournalEntry[]>("/api/journal", []);
 
   return (
     <section>
@@ -24,7 +41,7 @@ export default async function JournalPage() {
           </tr>
         </thead>
         <tbody>
-          {entries.map((entry: any) => (
+          {entries.map((entry) => (
             <tr key={entry.id}>
               <td>{entry.symbol?.ticker}</td>
               <td>{entry.setupType}</td>

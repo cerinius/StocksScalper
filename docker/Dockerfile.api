@@ -1,13 +1,13 @@
 FROM node:20-alpine
 
 WORKDIR /app
-COPY package.json tsconfig.base.json ./
-COPY packages ./packages
-COPY apps/api ./apps/api
+COPY . .
 
-RUN npm install
+RUN apk add --no-cache openssl
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 RUN npm run prisma:generate -w packages/db
-RUN npm run build -w packages/core -w packages/db -w apps/api
+RUN npm run build:packages
+RUN npm run build -w apps/api
 
-EXPOSE 3001
-CMD ["node", "apps/api/dist/index.js"]
+EXPOSE 4210
+CMD ["sh", "-c", "until npm run prisma:migrate:deploy -w packages/db; do echo 'Waiting for database...'; sleep 2; done; npm run seed -w packages/db; npm run start -w apps/api"]

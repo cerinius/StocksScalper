@@ -3,40 +3,68 @@ import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
-import { universeRoutes } from "./routes/universe";
-import { symbolRoutes } from "./routes/symbols";
-import { setupRoutes } from "./routes/setups";
-import { journalRoutes } from "./routes/journal";
-import { jobRoutes } from "./routes/jobs";
-import { tradingViewRoutes } from "./routes/tradingview";
+import { getPlatformConfig } from "@stock-radar/config";
+import { createLogger } from "@stock-radar/logging";
+import { authPreHandler } from "./lib/auth";
+import { dashboardPlugin } from "./modules/dashboard/plugin";
+import { workersPlugin } from "./modules/workers/plugin";
+import { newsPlugin } from "./modules/news/plugin";
+import { tradeIdeasPlugin } from "./modules/trade-ideas/plugin";
+import { validationPlugin } from "./modules/validation/plugin";
+import { executionPlugin } from "./modules/execution/plugin";
+import { portfolioPlugin } from "./modules/portfolio/plugin";
+import { integrationsPlugin } from "./modules/integrations/plugin";
+import { auditPlugin } from "./modules/audit/plugin";
+import { notificationsPlugin } from "./modules/notifications/plugin";
+import { controlPlugin } from "./modules/control/plugin";
+import { webhooksPlugin } from "./modules/webhooks/plugin";
 
-const app = Fastify({ logger: true });
+const config = getPlatformConfig();
+const logger = createLogger("api");
+const app = Fastify({ logger: false });
 
 const start = async () => {
   await app.register(cors, { origin: true });
   await app.register(helmet);
   await app.register(swagger, {
-    swagger: {
+    openapi: {
       info: {
-        title: "Stock Radar API",
+        title: "Stock Radar Platform API",
         version: "0.1.0",
       },
     },
   });
   await app.register(swaggerUi, { routePrefix: "/docs" });
 
-  await app.register(universeRoutes);
-  await app.register(symbolRoutes);
-  await app.register(setupRoutes);
-  await app.register(journalRoutes);
-  await app.register(jobRoutes);
-  await app.register(tradingViewRoutes);
+  app.get("/health", async () => ({
+    ok: true,
+    service: "api",
+    timestamp: new Date().toISOString(),
+  }));
 
-  const port = Number(process.env.PORT ?? "3001");
-  await app.listen({ port, host: "0.0.0.0" });
+  app.get("/api/session", { preHandler: authPreHandler }, async (request) => ({
+    user: request.platformUser,
+    tradingMode: config.trading.mode,
+  }));
+
+  await app.register(dashboardPlugin);
+  await app.register(workersPlugin);
+  await app.register(newsPlugin);
+  await app.register(tradeIdeasPlugin);
+  await app.register(validationPlugin);
+  await app.register(executionPlugin);
+  await app.register(portfolioPlugin);
+  await app.register(integrationsPlugin);
+  await app.register(auditPlugin);
+  await app.register(notificationsPlugin);
+  await app.register(controlPlugin);
+  await app.register(webhooksPlugin);
+
+  await app.listen({ port: config.ports.api, host: "0.0.0.0" });
+  logger.info("API listening", { port: config.ports.api });
 };
 
 start().catch((error) => {
-  app.log.error(error);
+  logger.error("API failed to start", { error: error.message });
   process.exit(1);
 });

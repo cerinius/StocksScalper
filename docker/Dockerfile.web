@@ -1,11 +1,13 @@
 FROM node:20-alpine
 
 WORKDIR /app
-COPY package.json tsconfig.base.json ./
-COPY apps/web ./apps/web
+COPY . .
 
-RUN npm install
+RUN apk add --no-cache openssl
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN npm run prisma:generate -w packages/db
+RUN npm run build:packages
 RUN npm run build -w apps/web
 
-EXPOSE 3000
-CMD ["npm", "run", "dev", "-w", "apps/web", "--", "-p", "3000"]
+EXPOSE 3210
+CMD ["npm", "run", "start", "-w", "apps/web"]

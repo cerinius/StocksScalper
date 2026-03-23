@@ -7,229 +7,766 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum SetupType {
-  breakout_retest
-  pullback_continuation
-  gap_and_go
-  reversal_major_level
-  relative_strength_leader
-  opening_range_breakout
-  vwap_reclaim
-  liquidity_sweep_reclaim
+enum AssetClass {
+  EQUITY
+  ETF
+  FX
+  COMMODITY
+  INDEX
+  CRYPTO
 }
 
-enum SetupTimeframe {
-  swing
-  scalp
+enum UserRoleKey {
+  ADMIN
+  OPERATOR
+  VIEWER
+  RISK_MANAGER
+  TRADER
 }
 
-enum SetupStatus {
-  watch
-  triggered
-  invalidated
-  expired
+enum IntegrationKind {
+  DISCORD
+  TRADINGVIEW
+  MT5
+  MARKET_DATA
+  NEWS_DATA
+}
+
+enum IntegrationStatusType {
+  CONNECTED
+  DISCONNECTED
+  DEGRADED
+  ERROR
+  PENDING
+}
+
+enum WorkerType {
+  NEWS
+  MARKET
+  VALIDATION
+  EXECUTION
+  SUPERVISOR
+}
+
+enum WorkerRunStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum Severity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum NewsDirection {
+  BULLISH
+  BEARISH
+  NEUTRAL
+}
+
+enum NewsUrgency {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum VolatilityImpact {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum CandidateStatus {
+  NEW
+  SCANNED
+  VALIDATING
+  VALIDATED
+  REJECTED
+  EXECUTED
+  CLOSED
+  INVALIDATED
+}
+
+enum ValidationStatus {
+  PENDING
+  PASSED
+  FAILED
+  STALE
+}
+
+enum ExecutionAction {
+  PLACE
+  HOLD
+  SKIP
+  CLOSE
+  REDUCE
+  INVALIDATE
+}
+
+enum ExecutionDecisionStatus {
+  PROPOSED
+  APPROVED
+  SENT
+  APPLIED
+  REJECTED
+  SIMULATED
+}
+
+enum TradingMode {
+  PAPER
+  LIVE
+}
+
+enum OrderStatus {
+  PENDING
+  SUBMITTED
+  FILLED
+  REJECTED
+  CANCELED
+}
+
+enum PositionStatus {
+  OPEN
+  REDUCED
+  CLOSED
+}
+
+enum RiskState {
+  NORMAL
+  CAUTION
+  BLOCKED
+  KILL_SWITCH
+}
+
+enum NotificationChannel {
+  DISCORD
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  SUPPRESSED
+}
+
+enum WebhookKind {
+  TRADINGVIEW
+}
+
+enum WebhookProcessingStatus {
+  PENDING
+  PROCESSED
+  REJECTED
+  DUPLICATE
+}
+
+enum ActorType {
+  SYSTEM
+  USER
+  WORKER
+  WEBHOOK
+}
+
+model User {
+  id          String     @id @default(cuid())
+  email       String     @unique
+  name        String
+  isActive    Boolean    @default(true)
+  lastLoginAt DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  roles UserRole[]
+}
+
+model Role {
+  id          String      @id @default(cuid())
+  key         UserRoleKey @unique
+  label       String
+  description String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  users UserRole[]
+}
+
+model UserRole {
+  id        String   @id @default(cuid())
+  userId    String
+  roleId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
 }
 
 model Symbol {
-  id       String   @id @default(cuid())
-  ticker   String   @unique
-  name     String?
-  exchange String?
-  active   Boolean  @default(true)
+  id               String         @id @default(cuid())
+  ticker           String         @unique
+  name             String?
+  assetClass       AssetClass
+  sector           String?
+  exchange         String?
+  isActive         Boolean        @default(true)
+  correlationGroup String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
 
-  dailyBars    DailyBar[]
-  intradayBars IntradayBar[]
-  newsItems    NewsItem[]
-  features     FeatureDaily[]
-  levels       LevelMap[]
-  setups       SetupCandidate[]
-  trades       TradeJournal[]
-  watchlistItems WatchlistItem[]
+  newsLinks        SymbolNewsLink[]
+  marketSnapshots  MarketSnapshot[]
+  priceBars        PriceBar[]
+  tradeCandidates  TradeCandidate[]
+  orders           Order[]
+  positions        Position[]
+  watchlistItems   WatchlistItem[]
+  auditLogs        AuditLog[]
+
+  @@index([assetClass, isActive])
+  @@index([sector])
 }
 
-model UniverseSnapshot {
-  id           String                 @id @default(cuid())
-  snapshotDate DateTime
-  createdAt    DateTime               @default(now())
-  notes        String?
-  items        UniverseSnapshotItem[]
+model Integration {
+  id         String          @id @default(cuid())
+  kind       IntegrationKind
+  name       String
+  mode       TradingMode?
+  enabled    Boolean         @default(true)
+  configJson Json
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  statuses         IntegrationStatus[]
+  providerConfigs  ProviderConfig[]
+  accountSnapshots AccountSnapshot[]
+  orders           Order[]
+}
+
+model IntegrationStatus {
+  id              String                @id @default(cuid())
+  integrationId   String
+  status          IntegrationStatusType
+  summary         String
+  details         Json?
+  lastHeartbeatAt DateTime?
+  lastSyncAt      DateTime?
+  failureCount    Int                   @default(0)
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([integrationId, status])
+}
+
+model ProviderConfig {
+  id            String          @id @default(cuid())
+  integrationId String?
+  kind          IntegrationKind
+  name          String
+  isDefault     Boolean         @default(false)
+  enabled       Boolean         @default(true)
+  configJson    Json
+  secretMask    String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  integration Integration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+
+  @@index([kind, enabled])
+}
+
+model WorkerRun {
+  id            String          @id @default(cuid())
+  workerType    WorkerType
+  status        WorkerRunStatus
+  queueName     String
+  jobName       String
+  attempt       Int             @default(1)
+  payload       Json?
+  resultSummary String?
+  reasoning     Json?
+  correlationId String?
+  startedAt     DateTime        @default(now())
+  finishedAt    DateTime?
+  durationMs    Int?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  failures WorkerFailure[]
+
+  @@index([workerType, status])
+  @@index([startedAt])
+}
+
+model WorkerHeartbeat {
+  id          String     @id @default(cuid())
+  workerType  WorkerType @unique
+  serviceName String
+  status      String
+  currentTask String?
+  lagMs       Int        @default(0)
+  metrics     Json?
+  lastSeenAt  DateTime   @default(now())
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+model WorkerFailure {
+  id           String     @id @default(cuid())
+  workerRunId  String?
+  workerType   WorkerType
+  errorMessage String
+  stack        String?
+  payload      Json?
+  retryCount   Int        @default(0)
+  occurredAt   DateTime   @default(now())
+  resolvedAt   DateTime?
+
+  workerRun WorkerRun? @relation(fields: [workerRunId], references: [id], onDelete: SetNull)
+
+  @@index([workerType, occurredAt])
+}
+
+model NotificationTemplate {
+  id            String              @id @default(cuid())
+  key           String              @unique
+  channel       NotificationChannel
+  severity      Severity
+  titleTemplate String
+  bodyTemplate  String
+  enabled       Boolean             @default(true)
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  notifications Notification[]
+}
+
+model Notification {
+  id            String              @id @default(cuid())
+  templateId    String?
+  category      String
+  severity      Severity
+  channel       NotificationChannel
+  status        NotificationStatus  @default(PENDING)
+  dedupeKey     String
+  title         String
+  body          String
+  payload       Json?
+  retryCount    Int                 @default(0)
+  lastAttemptAt DateTime?
+  deliveredAt   DateTime?
+  errorMessage  String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  template         NotificationTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  supervisorEvents SupervisorEvent[]
+
+  @@index([category, severity])
+  @@index([status, createdAt])
+  @@index([dedupeKey])
+}
+
+model NewsItem {
+  id                  String           @id @default(cuid())
+  source              String
+  headline            String
+  summary             String
+  originalTimestamp   DateTime
+  ingestedAt          DateTime         @default(now())
+  directionalBias     NewsDirection
+  urgency             NewsUrgency
+  relevanceScore      Float
+  volatilityImpact    VolatilityImpact
+  confidence          Float
+  tags                Json
+  category            String
+  affectedAssetClass  Json
+  rawPayloadRef       String
+  reasoningLog        Json
+  dedupeHash          String           @unique
+  status              String
+  metadata            Json?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  symbolLinks SymbolNewsLink[]
+
+  @@index([urgency, originalTimestamp])
+  @@index([source, category])
+}
+
+model SymbolNewsLink {
+  id             String   @id @default(cuid())
+  newsItemId     String
+  symbolId       String
+  relevanceScore Float
+  reasoning      String?
+
+  newsItem NewsItem @relation(fields: [newsItemId], references: [id], onDelete: Cascade)
+  symbol   Symbol   @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+
+  @@unique([newsItemId, symbolId])
+  @@index([symbolId])
 }
 
 model Watchlist {
-  id        String         @id @default(cuid())
-  name      String
-  createdAt DateTime       @default(now())
-  notes     String?
-  items     WatchlistItem[]
+  id             String          @id @default(cuid())
+  name           String
+  description    String?
+  tier           String
+  scanIntervalMs Int
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  items WatchlistItem[]
 }
 
 model WatchlistItem {
-  id          String    @id @default(cuid())
+  id         String   @id @default(cuid())
   watchlistId String
-  symbolId    String
-  createdAt   DateTime  @default(now())
-  notes       String?
+  symbolId   String
+  priority   Int      @default(50)
+  notes      String?
+  createdAt  DateTime @default(now())
 
-  watchlist Watchlist @relation(fields: [watchlistId], references: [id])
-  symbol    Symbol    @relation(fields: [symbolId], references: [id])
+  watchlist Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  symbol    Symbol    @relation(fields: [symbolId], references: [id], onDelete: Cascade)
 
   @@unique([watchlistId, symbolId])
 }
 
-model UniverseSnapshotItem {
-  id              String            @id @default(cuid())
-  snapshotId      String
-  symbolId        String
-  rank            Int
-  totalScore      Float
-  liquidityScore  Float
-  volatilityScore Float
-  volumeScore     Float
-  trendScore      Float
-  catalystScore   Float
-  metrics         Json
-
-  snapshot UniverseSnapshot @relation(fields: [snapshotId], references: [id])
-  symbol   Symbol           @relation(fields: [symbolId], references: [id])
-
-  @@index([snapshotId, rank])
-  @@index([symbolId])
-}
-
-model DailyBar {
-  id       String   @id @default(cuid())
-  symbolId String
-  date     DateTime
-  open     Float
-  high     Float
-  low      Float
-  close    Float
-  volume   Float
-
-  symbol Symbol @relation(fields: [symbolId], references: [id])
-
-  @@unique([symbolId, date])
-  @@index([symbolId, date])
-}
-
-model IntradayBar {
+model PriceBar {
   id        String   @id @default(cuid())
   symbolId  String
-  ts        DateTime
   timeframe String
+  timestamp DateTime
   open      Float
   high      Float
   low       Float
   close     Float
   volume    Float
 
-  symbol Symbol @relation(fields: [symbolId], references: [id])
+  symbol Symbol @relation(fields: [symbolId], references: [id], onDelete: Cascade)
 
-  @@unique([symbolId, ts, timeframe])
-  @@index([symbolId, ts])
+  @@unique([symbolId, timeframe, timestamp])
+  @@index([symbolId, timeframe, timestamp])
 }
 
-model NewsItem {
-  id          String   @id @default(cuid())
-  symbolId    String
-  publishedAt DateTime
-  headline    String
-  source      String
-  url         String
-  summary     String?
-  tags        Json?
-  sentiment   Float?
-  impactScore Float?
-
-  symbol Symbol @relation(fields: [symbolId], references: [id])
-
-  @@unique([url, publishedAt])
-  @@index([symbolId, publishedAt])
-}
-
-model FeatureDaily {
-  id        String   @id @default(cuid())
-  symbolId  String
-  date      DateTime
-  atr14     Float
-  atrPct    Float
-  rvol      Float
-  sma20     Float
-  sma50     Float
-  sma200    Float
-  returns20 Float
-  returns60 Float
-
-  symbol Symbol @relation(fields: [symbolId], references: [id])
-
-  @@unique([symbolId, date])
-  @@index([symbolId, date])
-}
-
-model LevelMap {
-  id        String   @id @default(cuid())
-  symbolId  String
-  date      DateTime
-  prevHigh  Float
-  prevLow   Float
-  prevClose Float
-  weekHigh  Float
-  weekLow   Float
-  gapLevels Json?
-
-  symbol Symbol @relation(fields: [symbolId], references: [id])
-
-  @@unique([symbolId, date])
-  @@index([symbolId, date])
-}
-
-model SetupCandidate {
-  id                String        @id @default(cuid())
+model MarketSnapshot {
+  id                String   @id @default(cuid())
   symbolId          String
-  createdAt         DateTime      @default(now())
-  setupType         SetupType
-  timeframe         SetupTimeframe
-  status            SetupStatus   @default(watch)
-  confidence        Float
-  trigger           Json
-  invalidation      Json
-  targets           Json
-  explanation       String
-  relatedSnapshotId String?
+  timeframe         String
+  snapshotAt        DateTime
+  currentPrice      Float
+  ohlcv             Json
+  indicatorSnapshot Json
+  supportLevels     Json?
+  resistanceLevels  Json?
+  trendBias         String?
+  volatilityRegime  String?
+  sessionName       String?
+  reasoningLog      Json
+  rawSnapshotRef    String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  symbol Symbol @relation(fields: [symbolId], references: [id])
-  events SetupEvent[]
+  symbol          Symbol           @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+  tradeCandidates TradeCandidate[]
 
+  @@index([symbolId, timeframe, snapshotAt])
+}
+
+model TradeCandidate {
+  id                      String           @id @default(cuid())
+  symbolId                String
+  sourceWorkerType        WorkerType
+  timeframe               String
+  direction               String
+  strategyType            String
+  detectedAt              DateTime
+  currentPrice            Float
+  proposedEntry           Float
+  stopLoss                Float
+  takeProfit              Float
+  riskReward              Float
+  confidenceScore         Float
+  setupScore              Float
+  featureValues           Json
+  indicatorSnapshot       Json
+  marketSnapshotId        String?
+  reasoningLog            Json
+  status                  CandidateStatus  @default(NEW)
+  correlationTags         Json
+  volatilityClassification String
+  newsContext             Json?
+  dedupeHash              String?
+  invalidatedAt           DateTime?
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+
+  symbol          Symbol            @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+  marketSnapshot  MarketSnapshot?   @relation(fields: [marketSnapshotId], references: [id], onDelete: SetNull)
+  validationRuns  ValidationRun[]
+  decisions       ExecutionDecision[]
+  riskEvents      RiskEvent[]
+  incomingWebhooks IncomingWebhook[]
+
+  @@index([symbolId, status, detectedAt])
+  @@index([sourceWorkerType, detectedAt])
+}
+
+model ValidationRun {
+  id                        String           @id @default(cuid())
+  candidateId               String
+  status                    ValidationStatus @default(PENDING)
+  finalValidationScore      Float
+  winRateEstimate           Float
+  averageReturn             Float
+  averageAdverseExcursion   Float
+  averageFavorableExcursion Float
+  maxDrawdown               Float
+  profitFactor              Float
+  expectancy                Float
+  confidenceScore           Float
+  confidenceIntervalLow     Float
+  confidenceIntervalHigh    Float
+  sampleSize                Int
+  dataQualityNotes          Json
+  reasonsFor                Json
+  reasonsAgainst            Json
+  invalidationConditions    Json?
+  backtestMetadata          Json
+  createdAt                 DateTime         @default(now())
+  completedAt               DateTime?
+  updatedAt                 DateTime         @updatedAt
+
+  candidate        TradeCandidate      @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  backtestResults  BacktestResult[]
+  decisions        ExecutionDecision[]
+
+  @@index([candidateId, createdAt])
+}
+
+model BacktestResult {
+  id                    String   @id @default(cuid())
+  validationRunId       String
+  scenarioLabel         String
+  similarityScore       Float
+  outcomeR              Float
+  returnPct             Float
+  maxAdverseExcursion   Float
+  maxFavorableExcursion Float
+  holdBars              Int
+  occurredAt            DateTime
+  context               Json
+
+  validationRun ValidationRun @relation(fields: [validationRunId], references: [id], onDelete: Cascade)
+
+  @@index([validationRunId, similarityScore])
+}
+
+model ExecutionDecision {
+  id                   String                  @id @default(cuid())
+  candidateId          String
+  validationRunId      String?
+  action               ExecutionAction
+  confidence           Float
+  riskScore            Float
+  evidenceSummary      String
+  reasons              Json
+  blockingReasons      Json
+  supportingReferences Json
+  executionParameters  Json?
+  status               ExecutionDecisionStatus @default(PROPOSED)
+  mode                 TradingMode
+  idempotencyKey       String                  @unique
+  createdAt            DateTime                @default(now())
+  executedAt           DateTime?
+  updatedAt            DateTime                @updatedAt
+
+  candidate      TradeCandidate  @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  validationRun  ValidationRun?  @relation(fields: [validationRunId], references: [id], onDelete: SetNull)
+  orders         Order[]
+  riskEvents     RiskEvent[]
+
+  @@index([status, createdAt])
+}
+
+model Order {
+  id            String       @id @default(cuid())
+  symbolId      String
+  integrationId String?
+  decisionId    String?
+  broker        String
+  brokerOrderId String?      @unique
+  mode          TradingMode
+  direction     String
+  orderType     String
+  quantity      Float
+  entryPrice    Float
+  stopLoss      Float
+  takeProfit    Float
+  status        OrderStatus
+  submittedAt   DateTime?
+  filledAt      DateTime?
+  rejectedAt    DateTime?
+  payload       Json?
+  errorMessage  String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  symbol      Symbol             @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+  integration Integration?       @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  decision    ExecutionDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+  positions   Position[]
+
+  @@index([symbolId, status])
+  @@index([decisionId])
+}
+
+model Position {
+  id              String         @id @default(cuid())
+  symbolId        String
+  orderId         String?
+  brokerPositionId String?       @unique
+  direction       String
+  quantity        Float
+  avgEntryPrice   Float
+  stopLoss        Float
+  takeProfit      Float
+  unrealizedPnl   Float
+  realizedPnl     Float
+  exposurePct     Float
+  status          PositionStatus
+  openedAt        DateTime
+  closedAt        DateTime?
+  metadata        Json?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  symbol     Symbol      @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+  order      Order?      @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  riskEvents RiskEvent[]
+
+  @@index([symbolId, status])
+}
+
+model AccountSnapshot {
+  id               String      @id @default(cuid())
+  integrationId    String?
+  capturedAt       DateTime    @default(now())
+  balance          Float
+  equity           Float
+  freeMargin       Float
+  usedMargin       Float
+  marginLevel      Float
+  openPnl          Float
+  realizedPnlDaily Float
+  drawdownPct      Float
+  maxDrawdownPct   Float
+  riskState        RiskState
+  killSwitchActive Boolean     @default(false)
+  mode             TradingMode
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  integration Integration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+
+  @@index([capturedAt])
+}
+
+model RiskEvent {
+  id          String   @id @default(cuid())
+  severity    Severity
+  eventType   String
+  message     String
+  details     Json?
+  blocking    Boolean  @default(false)
+  candidateId String?
+  decisionId  String?
+  positionId  String?
+  createdAt   DateTime @default(now())
+  resolvedAt  DateTime?
+  updatedAt   DateTime @updatedAt
+
+  candidate TradeCandidate?   @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  decision  ExecutionDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+  position  Position?         @relation(fields: [positionId], references: [id], onDelete: SetNull)
+
+  @@index([severity, createdAt])
+}
+
+model AuditLog {
+  id            String     @id @default(cuid())
+  actorType     ActorType
+  actorId       String?
+  workerType    WorkerType?
+  severity      Severity
+  category      String
+  message       String
+  entityType    String?
+  entityId      String?
+  symbolId      String?
+  correlationId String?
+  data          Json?
+  createdAt     DateTime   @default(now())
+
+  symbol Symbol? @relation(fields: [symbolId], references: [id], onDelete: SetNull)
+
+  @@index([category, createdAt])
   @@index([symbolId, createdAt])
 }
 
-model SetupEvent {
-  id               String   @id @default(cuid())
-  setupCandidateId String
-  occurredAt       DateTime
-  eventType        String
-  payload          Json?
-
-  setupCandidate SetupCandidate @relation(fields: [setupCandidateId], references: [id])
-
-  @@index([setupCandidateId, occurredAt])
+model SystemSetting {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       Json
+  valueType   String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }
 
-model TradeJournal {
-  id        String   @id @default(cuid())
-  symbolId  String
-  createdAt DateTime @default(now())
-  setupType SetupType
-  direction String
-  entry     Float
-  stop      Float
-  target    Float
-  exit      Float?
-  pnl       Float?
-  notes     String?
-  tags      Json?
+model SupervisorEvent {
+  id             String        @id @default(cuid())
+  severity       Severity
+  eventType      String
+  summary        String
+  details        Json?
+  notificationId String?
+  resolvedAt     DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
-  symbol Symbol @relation(fields: [symbolId], references: [id])
+  notification Notification? @relation(fields: [notificationId], references: [id], onDelete: SetNull)
 
-  @@index([symbolId, createdAt])
+  @@index([severity, createdAt])
+}
+
+model IncomingWebhook {
+  id                 String                  @id @default(cuid())
+  kind               WebhookKind
+  sourceIp           String?
+  headers            Json?
+  payload            Json
+  signatureValid     Boolean                 @default(false)
+  dedupeHash         String                  @unique
+  processingStatus   WebhookProcessingStatus @default(PENDING)
+  processedAt        DateTime?
+  createdCandidateId String?
+  auditLogId         String?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+
+  createdCandidate TradeCandidate? @relation(fields: [createdCandidateId], references: [id], onDelete: SetNull)
+
+  @@index([kind, createdAt])
 }

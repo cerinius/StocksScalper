@@ -1,4 +1,6 @@
-export type Timeframe = "swing" | "scalp";
+export * from "@stock-radar/types";
+
+export type SetupTimeframe = "swing" | "scalp";
 
 export type SetupType =
   | "breakout_retest"
@@ -8,7 +10,9 @@ export type SetupType =
   | "relative_strength_leader"
   | "opening_range_breakout"
   | "vwap_reclaim"
-  | "liquidity_sweep_reclaim";
+  | "liquidity_sweep_reclaim"
+  | "trend_pullback"
+  | "breakout_continuation";
 
 export type SetupStatus = "watch" | "triggered" | "invalidated" | "expired";
 
@@ -75,7 +79,7 @@ export interface ScoredCandidate {
 export interface SetupCandidate {
   symbol: string;
   setupType: SetupType;
-  timeframe: Timeframe;
+  timeframe: SetupTimeframe;
   confidence: number;
   trigger: Record<string, unknown>;
   invalidation: Record<string, unknown>;

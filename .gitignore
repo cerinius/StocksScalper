@@ -4,3 +4,6 @@ dist
 .env
 coverage
 codex.patch
+apps/*/dist
+apps/*/.next
+packages/*/dist

@@ -1,0 +1,12 @@
+FROM node:20-alpine
+
+WORKDIR /app
+COPY . .
+
+RUN apk add --no-cache openssl
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN npm run prisma:generate -w packages/db
+RUN npm run build:packages
+RUN npm run build -w apps/worker-news
+
+CMD ["npm", "run", "start", "-w", "apps/worker-news"]

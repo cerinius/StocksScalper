@@ -1,0 +1,14 @@
+{
+  "alertName": "Opening Range Breakout",
+  "symbol": "AAPL",
+  "timeframe": "5m",
+  "direction": "LONG",
+  "strategy": "opening_range_breakout",
+  "price": 191.42,
+  "message": "ORB trigger confirmed with expanding volume and market breadth support.",
+  "metadata": {
+    "session": "new_york",
+    "chart": "tradingview",
+    "setupFamily": "intraday-breakout"
+  }
+}

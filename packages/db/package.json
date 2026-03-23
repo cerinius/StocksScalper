@@ -5,12 +5,19 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "lint": "eslint .",
-    "test": "vitest",
-    "prisma:generate": "prisma generate"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:push": "prisma db push",
+    "seed": "npm run build && node dist/seed.js"
   },
   "dependencies": {
-    "@prisma/client": "^5.18.0"
+    "@prisma/client": "^5.18.0",
+    "@stock-radar/config": "*",
+    "@stock-radar/core": "*",
+    "@stock-radar/shared": "*",
+    "@stock-radar/types": "*"
   },
   "devDependencies": {
     "prisma": "^5.18.0",

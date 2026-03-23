@@ -1,14 +1,29 @@
-const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
+const apiBase = process.env.API_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:3001";
+export const dynamic = "force-dynamic";
 
-const fetchJson = async (path: string) => {
-  const res = await fetch(`${apiBase}${path}`, { next: { revalidate: 10 } });
-  if (!res.ok) return [];
-  return res.json();
+interface SetupItem {
+  id: string;
+  setupType: string;
+  confidence: number;
+  status: string;
+  symbol?: {
+    ticker?: string;
+  };
+}
+
+const fetchJson = async <T,>(path: string, fallback: T): Promise<T> => {
+  try {
+    const res = await fetch(`${apiBase}${path}`);
+    if (!res.ok) return fallback;
+    return (await res.json()) as T;
+  } catch {
+    return fallback;
+  }
 };
 
 export default async function SetupsPage() {
-  const swing = await fetchJson("/api/setups?status=watch&tf=swing");
-  const scalp = await fetchJson("/api/setups?status=watch&tf=scalp");
+  const swing = await fetchJson<SetupItem[]>("/api/setups?status=watch&tf=swing", []);
+  const scalp = await fetchJson<SetupItem[]>("/api/setups?status=watch&tf=scalp", []);
 
   return (
     <>
@@ -24,7 +39,7 @@ export default async function SetupsPage() {
             </tr>
           </thead>
           <tbody>
-            {swing.map((item: any) => (
+            {swing.map((item) => (
               <tr key={item.id}>
                 <td>{item.symbol?.ticker}</td>
                 <td>{item.setupType}</td>
@@ -48,7 +63,7 @@ export default async function SetupsPage() {
             </tr>
           </thead>
           <tbody>
-            {scalp.map((item: any) => (
+            {scalp.map((item) => (
               <tr key={item.id}>
                 <td>{item.symbol?.ticker}</td>
                 <td>{item.setupType}</td>
