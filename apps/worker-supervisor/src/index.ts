@@ -8,6 +8,149 @@ import { createPlatformWorker, ensureDefaultSchedules, queueNames } from "@stock
 const config = getPlatformConfig();
 const logger = createLogger("worker-supervisor");
 const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
+const asObject = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+
+const readDynamicControls = async () => {
+  const setting = await prisma.systemSetting.findUnique({ where: { key: "risk.dynamicControls" } });
+  const value = asObject(setting?.value);
+  const maxRiskPerTradePct =
+    typeof value?.maxRiskPerTradePct === "number" && Number.isFinite(value.maxRiskPerTradePct)
+      ? value.maxRiskPerTradePct
+      : config.risk.maxRiskPerTradePct;
+  const lastAdjustedAt = typeof value?.lastAdjustedAt === "string" ? value.lastAdjustedAt : null;
+
+  return {
+    maxRiskPerTradePct,
+    lastAdjustedAt,
+    reason: typeof value?.reason === "string" ? value.reason : null,
+  };
+};
+
+const maybeThrottleRisk = async (
+  account: {
+    balance: number;
+    realizedPnlDaily: number;
+    drawdownPct: number;
+  } | null,
+) => {
+  const controls = await readDynamicControls();
+  if (!account) return null;
+
+  const recentPlacedDecisions = await prisma.executionDecision.findMany({
+    where: {
+      action: "PLACE",
+      validationRunId: {
+        not: null,
+      },
+    },
+    include: {
+      validationRun: true,
+    },
+    orderBy: { createdAt: "desc" },
+    take: 12,
+  });
+
+  const expectancies = recentPlacedDecisions
+    .map((decision) => decision.validationRun?.expectancy ?? null)
+    .filter((value): value is number => typeof value === "number");
+  const averageExpectancy =
+    expectancies.length === 0 ? 0 : expectancies.reduce((total, value) => total + value, 0) / expectancies.length;
+  const realizedLossPct =
+    account.balance <= 0 ? 0 : Math.max(0, (-Math.min(account.realizedPnlDaily, 0) / account.balance) * 100);
+  const drawdownPressure = account.drawdownPct >= Math.max(1, config.risk.maxDailyLossPct * 0.5);
+  const expectancyMismatch = averageExpectancy >= 0.15 && realizedLossPct >= config.risk.maxRiskPerTradePct * 0.75;
+
+  if (!drawdownPressure && !expectancyMismatch) {
+    return null;
+  }
+
+  if (controls.lastAdjustedAt) {
+    const lastAdjustedMs = new Date(controls.lastAdjustedAt).getTime();
+    if (Date.now() - lastAdjustedMs < config.risk.riskThrottleCooldownMinutes * 60_000) {
+      return null;
+    }
+  }
+
+  if (controls.maxRiskPerTradePct <= config.risk.minDynamicRiskPerTradePct) {
+    return null;
+  }
+
+  const nextRiskPerTradePct = Math.max(
+    config.risk.minDynamicRiskPerTradePct,
+    Number((controls.maxRiskPerTradePct - config.risk.riskThrottleStepPct).toFixed(2)),
+  );
+  if (nextRiskPerTradePct >= controls.maxRiskPerTradePct) {
+    return null;
+  }
+
+  const reason = drawdownPressure
+    ? `Drawdown reached ${account.drawdownPct.toFixed(2)}%, so dynamic risk was reduced.`
+    : `Expected edge stayed positive (${averageExpectancy.toFixed(2)}R) while realized daily PnL lagged, so risk was reduced.`;
+
+  await prisma.systemSetting.upsert({
+    where: { key: "risk.dynamicControls" },
+    update: {
+      value: {
+        maxRiskPerTradePct: nextRiskPerTradePct,
+        lastAdjustedAt: new Date().toISOString(),
+        reason,
+      },
+      valueType: "json",
+      description: "Supervisor-managed dynamic execution throttle",
+    },
+    create: {
+      key: "risk.dynamicControls",
+      value: {
+        maxRiskPerTradePct: nextRiskPerTradePct,
+        lastAdjustedAt: new Date().toISOString(),
+        reason,
+      },
+      valueType: "json",
+      description: "Supervisor-managed dynamic execution throttle",
+    },
+  });
+
+  await prisma.riskEvent.create({
+    data: {
+      severity: "WARNING",
+      eventType: "dynamic_risk_throttle",
+      message: `Risk per trade was reduced from ${controls.maxRiskPerTradePct.toFixed(2)}% to ${nextRiskPerTradePct.toFixed(2)}%.`,
+      details: {
+        averageExpectancy,
+        realizedLossPct,
+        drawdownPct: account.drawdownPct,
+        previousRiskPerTradePct: controls.maxRiskPerTradePct,
+        nextRiskPerTradePct,
+      },
+      blocking: false,
+    },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      actorType: "WORKER",
+      actorId: "worker-supervisor",
+      workerType: "SUPERVISOR",
+      severity: "WARNING",
+      category: "supervisor.dynamic_risk",
+      message: `Supervisor lowered max risk per trade to ${nextRiskPerTradePct.toFixed(2)}%.`,
+      entityType: "system_setting",
+      entityId: "risk.dynamicControls",
+      data: {
+        averageExpectancy,
+        realizedLossPct,
+        previousRiskPerTradePct: controls.maxRiskPerTradePct,
+        nextRiskPerTradePct,
+      },
+    },
+  });
+
+  return {
+    summary: `Dynamic risk throttle lowered max risk per trade to ${nextRiskPerTradePct.toFixed(2)}%.`,
+    nextRiskPerTradePct,
+  };
+};
 
 const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | "manual") => {
   const run = await createWorkerRun({
@@ -52,6 +195,15 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
         prisma.workerHeartbeat.findMany({ orderBy: { workerType: "asc" } }),
         prisma.accountSnapshot.findFirst({ orderBy: { capturedAt: "desc" } }),
       ]);
+      const throttleEvent = await maybeThrottleRisk(
+        account
+          ? {
+              balance: account.balance,
+              realizedPnlDaily: account.realizedPnlDaily,
+              drawdownPct: account.drawdownPct,
+            }
+          : null,
+      );
 
       const workerAlerts = summarizeWorkerHealth(
         heartbeats.map((heartbeat) => ({
@@ -85,8 +237,11 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
             }
           : null,
       );
+      const throttleAlerts = throttleEvent
+        ? [{ severity: "warning" as const, summary: throttleEvent.summary }]
+        : [];
 
-      for (const alert of [...workerAlerts, ...accountAlerts]) {
+      for (const alert of [...workerAlerts, ...accountAlerts, ...throttleAlerts]) {
         const notification = await prisma.notification.create({
           data: {
             category: alert.severity === "critical" ? "supervisor" : "worker_health",

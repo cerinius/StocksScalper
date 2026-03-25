@@ -1,7 +1,7 @@
 import { prisma } from "@stock-radar/db";
 
 export const getDashboardSummary = async () => {
-  const [account, activeTrades, recentActions, riskWarnings, heartbeats] = await Promise.all([
+  const [account, activeTrades, recentActions, riskWarnings, heartbeats, dynamicRiskSetting] = await Promise.all([
     prisma.accountSnapshot.findFirst({ orderBy: { capturedAt: "desc" } }),
     prisma.position.count({ where: { status: "OPEN" } }),
     prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: 8 }),
@@ -13,7 +13,12 @@ export const getDashboardSummary = async () => {
       take: 6,
     }),
     prisma.workerHeartbeat.findMany({ orderBy: { workerType: "asc" } }),
+    prisma.systemSetting.findUnique({ where: { key: "risk.dynamicControls" } }),
   ]);
+  const dynamicRiskValue =
+    dynamicRiskSetting && typeof dynamicRiskSetting.value === "object" && dynamicRiskSetting.value && !Array.isArray(dynamicRiskSetting.value)
+      ? (dynamicRiskSetting.value as { maxRiskPerTradePct?: number }).maxRiskPerTradePct
+      : undefined;
 
   return {
     account,
@@ -34,5 +39,6 @@ export const getDashboardSummary = async () => {
     })),
     workerHealth: heartbeats,
     killSwitchActive: account?.killSwitchActive ?? false,
+    dynamicMaxRiskPerTradePct: typeof dynamicRiskValue === "number" ? dynamicRiskValue : null,
   };
 };

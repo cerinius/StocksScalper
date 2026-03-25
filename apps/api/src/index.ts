@@ -60,6 +60,7 @@ const start = async () => {
   await app.register(controlPlugin);
   await app.register(webhooksPlugin);
 
+
   await app.listen({ port: config.ports.api, host: "0.0.0.0" });
   logger.info("API listening", { port: config.ports.api });
 };

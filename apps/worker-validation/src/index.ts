@@ -1,9 +1,11 @@
-import { validateCandidate } from "@stock-radar/core";
+import { getPlatformConfig } from "@stock-radar/config";
+import { runMonteCarloSimulation, validateCandidate } from "@stock-radar/core";
 import { Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
 import { createPlatformQueues, createPlatformWorker, queueNames } from "@stock-radar/queues";
 
+const config = getPlatformConfig();
 const logger = createLogger("worker-validation");
 const queues = createPlatformQueues();
 const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
@@ -85,6 +87,21 @@ const processCandidate = async (candidateId?: string) => {
         },
         buildAnalogs(candidate),
       );
+      const monteCarlo = runMonteCarloSimulation(
+        validationBundle.analogs.map((analog) => analog.outcomeR),
+        {
+          simulations: config.risk.monteCarloSimulations,
+          riskPerTradePct: config.risk.maxRiskPerTradePct,
+          ruinDrawdownPct: config.risk.monteCarloRuinDrawdownPct,
+          seed: candidate.id.length + candidate.symbol.ticker.length,
+        },
+      );
+      const dataQualityNotes = [...validationBundle.metrics.dataQualityNotes];
+      if (monteCarlo.riskOfRuinPct >= 0.1) {
+        dataQualityNotes.push(
+          `Monte Carlo risk of ruin is elevated at ${(monteCarlo.riskOfRuinPct * 100).toFixed(1)}% using ${monteCarlo.simulations} simulations.`,
+        );
+      }
 
       const validationRun = await prisma.validationRun.create({
         data: {
@@ -102,11 +119,14 @@ const processCandidate = async (candidateId?: string) => {
           confidenceIntervalLow: validationBundle.metrics.confidenceIntervalLow,
           confidenceIntervalHigh: validationBundle.metrics.confidenceIntervalHigh,
           sampleSize: validationBundle.metrics.historicalSampleSize,
-          dataQualityNotes: asJson(validationBundle.metrics.dataQualityNotes),
+          dataQualityNotes: asJson(dataQualityNotes),
           reasonsFor: asJson(validationBundle.reasonsFor),
           reasonsAgainst: asJson(validationBundle.reasonsAgainst),
           invalidationConditions: asJson([{ type: "stop_loss", level: candidate.stopLoss }]),
-          backtestMetadata: asJson({ source: "rule_based_validation_worker" }),
+          backtestMetadata: asJson({
+            source: "rule_based_validation_worker",
+            monteCarlo,
+          }),
           completedAt: new Date(),
         },
       });

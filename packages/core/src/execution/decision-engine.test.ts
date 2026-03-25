@@ -72,6 +72,7 @@ describe("makeExecutionDecision", () => {
         maxTotalExposurePct: 20,
         maxSymbolExposurePct: 8,
         maxCorrelatedExposurePct: 12,
+        maxEntrySpreadPct: 0.08,
         staleSignalSeconds: 300,
         manualApprovalMode: false,
       },
@@ -80,5 +81,175 @@ describe("makeExecutionDecision", () => {
 
     expect(result.action).toBe("SKIP");
     expect(result.blockingReasons.length).toBeGreaterThan(0);
+  });
+
+  it("blocks when spread exceeds the configured cap", () => {
+    const result = makeExecutionDecision({
+      candidate: {
+        symbol: "AAPL",
+        timeframe: "5m",
+        direction: "LONG",
+        strategyType: "breakout_continuation",
+        detectedAt: new Date().toISOString(),
+        currentPrice: 190,
+        proposedEntry: 190,
+        stopLoss: 188,
+        takeProfit: 194,
+        riskReward: 2,
+        confidenceScore: 78,
+        setupScore: 82,
+        featureValues: {},
+        indicatorSnapshot: {
+          sma20: 180,
+          sma50: 175,
+          ema21: 181,
+          ema50: 176,
+          rsi14: 63,
+          macd: 1.2,
+          macdSignal: 0.9,
+          atr14: 3,
+          atrPct: 1.6,
+          volumeRatio: 1.4,
+          trendStrength: 50,
+          momentumScore: 60,
+        },
+        reasoningLog: [],
+        status: "VALIDATED",
+        correlationTags: ["tech"],
+        volatilityClassification: "bull_trend",
+      },
+      validation: {
+        winRateEstimate: 0.6,
+        averageReturn: 4.2,
+        averageAdverseExcursion: 0.6,
+        averageFavorableExcursion: 1.8,
+        maxDrawdown: 1.2,
+        profitFactor: 1.7,
+        expectancy: 0.52,
+        confidenceScore: 74,
+        confidenceIntervalLow: 0.2,
+        confidenceIntervalHigh: 0.8,
+        historicalSampleSize: 24,
+        dataQualityNotes: [],
+      },
+      account: {
+        balance: 100000,
+        equity: 99500,
+        freeMargin: 80000,
+        usedMargin: 19500,
+        openPnl: -500,
+        realizedPnlDaily: -250,
+        drawdownPct: 1.2,
+        maxDrawdownPct: 2.6,
+        riskState: "NORMAL",
+        killSwitchActive: false,
+        mode: "paper",
+      },
+      openPositions: [],
+      riskLimits: {
+        maxActiveTrades: 4,
+        maxDailyLossPct: 3,
+        maxRiskPerTradePct: 0.75,
+        maxTotalExposurePct: 20,
+        maxSymbolExposurePct: 8,
+        maxCorrelatedExposurePct: 12,
+        maxEntrySpreadPct: 0.08,
+        staleSignalSeconds: 300,
+        manualApprovalMode: false,
+      },
+      marketContext: {
+        spreadPct: 0.12,
+      },
+      references: [],
+    });
+
+    expect(result.action).toBe("SKIP");
+    expect(result.blockingReasons.some((reason) => reason.title === "Entry spread too wide")).toBe(true);
+  });
+
+  it("uses dynamic risk throttling and Kelly sizing when placing an order", () => {
+    const result = makeExecutionDecision({
+      candidate: {
+        symbol: "AAPL",
+        timeframe: "5m",
+        direction: "LONG",
+        strategyType: "breakout_continuation",
+        detectedAt: new Date().toISOString(),
+        currentPrice: 200,
+        proposedEntry: 200,
+        stopLoss: 198,
+        takeProfit: 205,
+        riskReward: 2.5,
+        confidenceScore: 82,
+        setupScore: 86,
+        featureValues: {},
+        indicatorSnapshot: {
+          sma20: 190,
+          sma50: 186,
+          ema21: 191,
+          ema50: 187,
+          rsi14: 66,
+          macd: 1.4,
+          macdSignal: 1.1,
+          atr14: 2.5,
+          atrPct: 1.2,
+          volumeRatio: 1.5,
+          trendStrength: 54,
+          momentumScore: 64,
+        },
+        reasoningLog: [],
+        status: "VALIDATED",
+        correlationTags: ["tech"],
+        volatilityClassification: "bull_trend",
+      },
+      validation: {
+        winRateEstimate: 0.63,
+        averageReturn: 4.2,
+        averageAdverseExcursion: 0.6,
+        averageFavorableExcursion: 1.8,
+        maxDrawdown: 1.2,
+        profitFactor: 1.9,
+        expectancy: 0.65,
+        confidenceScore: 84,
+        confidenceIntervalLow: 0.2,
+        confidenceIntervalHigh: 0.8,
+        historicalSampleSize: 36,
+        dataQualityNotes: [],
+      },
+      account: {
+        balance: 100000,
+        equity: 100000,
+        freeMargin: 90000,
+        usedMargin: 10000,
+        openPnl: 0,
+        realizedPnlDaily: 0,
+        drawdownPct: 0.4,
+        maxDrawdownPct: 2.6,
+        riskState: "NORMAL",
+        killSwitchActive: false,
+        mode: "paper",
+      },
+      openPositions: [],
+      riskLimits: {
+        maxActiveTrades: 4,
+        maxDailyLossPct: 3,
+        maxRiskPerTradePct: 0.75,
+        maxTotalExposurePct: 20,
+        maxSymbolExposurePct: 8,
+        maxCorrelatedExposurePct: 12,
+        maxEntrySpreadPct: 0.08,
+        staleSignalSeconds: 300,
+        manualApprovalMode: false,
+        dynamicRiskPerTradePct: 0.5,
+      },
+      marketContext: {
+        spreadPct: 0.03,
+      },
+      references: [],
+    });
+
+    expect(result.action).toBe("PLACE");
+    expect(result.executionParameters?.quantity ?? 0).toBeGreaterThan(0);
+    expect(result.reasons.some((reason) => reason.title === "Position sizing")).toBe(true);
   });
 });

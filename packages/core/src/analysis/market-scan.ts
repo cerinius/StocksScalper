@@ -1,18 +1,40 @@
 import type { NewsIntelligenceRecord, PriceBar, Timeframe, TradeCandidateRecord, TradeDirection } from "@stock-radar/types";
 import { buildReasoningLog, clamp, percentChange } from "@stock-radar/shared";
 import { calculateIndicatorSnapshot } from "./indicators";
+import { detectMarketRegime } from "./regime";
 
-const classifyVolatility = (atrPct: number) => {
-  if (atrPct >= 4) return "high";
-  if (atrPct >= 2) return "medium";
-  return "low";
-};
-
-const inferDirection = (momentumScore: number, news: NewsIntelligenceRecord[]): TradeDirection => {
+const inferDirection = (
+  momentumScore: number,
+  news: NewsIntelligenceRecord[],
+  regimeBias: TradeDirection | "NEUTRAL",
+): TradeDirection => {
   const bullishSignals = news.filter((item) => item.directionalBias === "BULLISH").length;
   const bearishSignals = news.filter((item) => item.directionalBias === "BEARISH").length;
+  if (regimeBias !== "NEUTRAL" && Math.abs(bullishSignals - bearishSignals) <= 1) {
+    return regimeBias;
+  }
   if (bearishSignals > bullishSignals && momentumScore < 0) return "SHORT";
   return "LONG";
+};
+
+const selectStrategyType = (
+  direction: TradeDirection,
+  rsi14: number,
+  preferredStrategy: "trend" | "mean_reversion" | "breakout" | "reversal",
+) => {
+  if (preferredStrategy === "breakout") {
+    return direction === "LONG" ? "breakout_continuation" : "breakdown_continuation";
+  }
+
+  if (preferredStrategy === "mean_reversion") {
+    return direction === "LONG" ? "vwap_reclaim" : "range_fade_short";
+  }
+
+  if (preferredStrategy === "reversal") {
+    return direction === "LONG" ? "liquidity_sweep_reclaim" : "reversal_major_level";
+  }
+
+  return direction === "LONG" ? (rsi14 > 60 ? "breakout_continuation" : "trend_pullback") : "breakdown_continuation";
 };
 
 export const analyzeMarketCandidate = (
@@ -28,30 +50,33 @@ export const analyzeMarketCandidate = (
   if (!latest || !oldest) return null;
 
   const indicatorSnapshot = calculateIndicatorSnapshot(bars);
+  const regime = detectMarketRegime(bars, indicatorSnapshot);
   const priceMomentumPct = percentChange(oldest.close, latest.close);
-  const direction = inferDirection(indicatorSnapshot.momentumScore, relevantNews);
+  const direction = inferDirection(indicatorSnapshot.momentumScore, relevantNews, regime.directionBias);
+  const regimeAlignmentScore =
+    (regime.directionBias === "NEUTRAL" ? 0 : regime.directionBias === direction ? 6 : -6) +
+    regime.confidence * 0.08;
   const confluenceScore =
     indicatorSnapshot.momentumScore * 0.35 +
     indicatorSnapshot.trendStrength * 0.25 +
     (indicatorSnapshot.volumeRatio - 1) * 20 +
-    relevantNews.reduce((total, item) => total + item.relevanceScore, 0) * 0.05;
+    relevantNews.reduce((total, item) => total + item.relevanceScore, 0) * 0.05 +
+    regimeAlignmentScore;
 
   const setupScore = clamp(55 + confluenceScore, 1, 100);
   if (setupScore < 60) return null;
 
-  const strategyType =
-    direction === "LONG"
-      ? indicatorSnapshot.rsi14 > 60
-        ? "breakout_continuation"
-        : "trend_pullback"
-      : "reversal_major_level";
+  const strategyType = selectStrategyType(direction, indicatorSnapshot.rsi14, regime.preferredStrategy);
   const currentPrice = latest.close;
-  const stopDistance = Math.max(indicatorSnapshot.atr14 * 1.1, currentPrice * 0.008);
+  const stopDistanceMultiplier = regime.preferredStrategy === "breakout" ? 1.35 : regime.preferredStrategy === "reversal" ? 0.95 : 1.1;
+  const stopDistance = Math.max(indicatorSnapshot.atr14 * stopDistanceMultiplier, currentPrice * 0.008);
   const proposedEntry = currentPrice;
   const stopLoss = direction === "LONG" ? currentPrice - stopDistance : currentPrice + stopDistance;
-  const takeProfit = direction === "LONG" ? currentPrice + stopDistance * 1.9 : currentPrice - stopDistance * 1.9;
+  const targetMultiple = regime.preferredStrategy === "breakout" ? 2.3 : regime.preferredStrategy === "mean_reversion" ? 1.6 : 1.9;
+  const takeProfit = direction === "LONG" ? currentPrice + stopDistance * targetMultiple : currentPrice - stopDistance * targetMultiple;
   const riskReward = Math.abs((takeProfit - proposedEntry) / Math.max(Math.abs(proposedEntry - stopLoss), 0.0001));
-  const confidenceScore = clamp(setupScore * 0.7 + Math.abs(priceMomentumPct) * 1.4, 1, 100);
+  const confidenceScore = clamp(setupScore * 0.68 + Math.abs(priceMomentumPct) * 1.25 + regime.confidence * 0.18, 1, 100);
+  const newsScore = relevantNews.reduce((total, item) => total + item.relevanceScore, 0);
 
   return {
     symbol,
@@ -71,10 +96,20 @@ export const analyzeMarketCandidate = (
       atrPct: indicatorSnapshot.atrPct,
       volumeRatio: indicatorSnapshot.volumeRatio,
       trendStrength: indicatorSnapshot.trendStrength,
-      newsScore: relevantNews.reduce((total, item) => total + item.relevanceScore, 0),
+      newsScore,
+      regimeConfidence: regime.confidence,
+      regimeBiasScore: regimeAlignmentScore,
     },
     indicatorSnapshot,
     reasoningLog: buildReasoningLog([
+      {
+        title: "Regime classification",
+        detail: `${symbol} is currently classified as ${regime.regime} with ${regime.confidence.toFixed(
+          1,
+        )}% confidence. ${regime.summary}`,
+        weight: clamp(regime.confidence / 100, 0.35, 0.95),
+        tags: ["regime", regime.regime, regime.preferredStrategy],
+      },
       {
         title: "Trend and momentum confluence",
         detail: `Momentum scored ${indicatorSnapshot.momentumScore.toFixed(1)} with RSI ${indicatorSnapshot.rsi14.toFixed(
@@ -97,7 +132,7 @@ export const analyzeMarketCandidate = (
       },
     ]),
     status: "NEW",
-    correlationTags: [symbol.slice(0, 3), direction === "LONG" ? "risk_on" : "risk_off"],
-    volatilityClassification: classifyVolatility(indicatorSnapshot.atrPct),
+    correlationTags: [symbol.slice(0, 3), regime.regime, direction === "LONG" ? "risk_on" : "risk_off"],
+    volatilityClassification: regime.regime,
   };
 };

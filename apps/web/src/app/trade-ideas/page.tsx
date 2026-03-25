@@ -9,6 +9,7 @@ interface TradeIdea {
   timeframe: string;
   direction: string;
   strategyType: string;
+  volatilityClassification: string;
   confidenceScore: number;
   setupScore: number;
   riskReward: number;
@@ -35,6 +36,7 @@ export default function TradeIdeasPage() {
               <th>Timeframe</th>
               <th>Direction</th>
               <th>Strategy</th>
+              <th>Regime</th>
               <th>Setup</th>
               <th>Confidence</th>
               <th>R/R</th>
@@ -49,6 +51,7 @@ export default function TradeIdeasPage() {
                 <td>{idea.timeframe}</td>
                 <td>{idea.direction}</td>
                 <td>{idea.strategyType}</td>
+                <td><StatusPill value={idea.volatilityClassification} /></td>
                 <td>{idea.setupScore.toFixed(1)}</td>
                 <td>{idea.confidenceScore.toFixed(1)}</td>
                 <td>{idea.riskReward.toFixed(2)}</td>

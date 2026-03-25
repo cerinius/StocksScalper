@@ -1,77 +1,177 @@
-import { getPlatformConfig } from "@stock-radar/config";
-import { MockNewsProvider, scoreNewsIntelligence } from "@stock-radar/core";
+import { setInterval } from "timers/promises";
 import { Prisma } from "@prisma/client";
-import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
+import { getPlatformConfig } from "@stock-radar/config";
+import {
+  completeWorkerRun,
+  createWorkerRun,
+  failWorkerRun,
+  prisma,
+  upsertWorkerHeartbeat,
+} from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
-import { createPlatformWorker, queueNames, queueNotification } from "@stock-radar/queues";
+import { queueNames } from "@stock-radar/queues";
+
+type PolygonNewsArticle = {
+  id: string;
+  title: string;
+  article_url?: string;
+  description?: string;
+  image_url?: string;
+  published_utc: string;
+  tickers?: string[];
+  keywords?: string[];
+  publisher?: {
+    name?: string;
+  };
+};
+
+type PolygonNewsResponse = {
+  results?: PolygonNewsArticle[];
+};
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-news");
-const provider = new MockNewsProvider();
+
+const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const POLLING_INTERVAL = Number(process.env.NEWS_URGENT_INTERVAL_MS ?? "60000");
+const NEWS_LIMIT = Number(process.env.NEWS_LIMIT ?? "25");
+const SEND_LATEST_ON_STARTUP = process.env.SEND_LATEST_ON_STARTUP === "true";
+
+const CURSOR_SETTING_KEY = "news.latestArticleId";
+
+let isRunning = false;
+
 const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
 
-const upsertNewsItem = async (symbol: string, item: ReturnType<typeof scoreNewsIntelligence>) => {
-  const existing = await prisma.newsItem.findUnique({ where: { dedupeHash: item.dedupeHash } });
-  const symbolRecord = await prisma.symbol.upsert({
-    where: { ticker: symbol },
-    update: { isActive: true },
-    create: {
-      ticker: symbol,
-      name: symbol,
-      assetClass: symbol.endsWith("USD") ? "FX" : "EQUITY",
-      exchange: symbol.endsWith("USD") ? "OTC" : "NASDAQ",
-    },
+function ensurePositiveNumber(value: number, name: string) {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
+}
+
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getLatestArticleId(): Promise<string | null> {
+  const row = await prisma.systemSetting.findUnique({
+    where: { key: CURSOR_SETTING_KEY },
   });
 
-  const newsItem =
-    existing ??
-    (await prisma.newsItem.create({
-      data: {
-        source: item.source,
-        headline: item.headline,
-        summary: item.summary,
-        originalTimestamp: new Date(item.originalTimestamp),
-        ingestedAt: new Date(item.ingestionTimestamp),
-        directionalBias: item.directionalBias,
-        urgency: item.urgency,
-        relevanceScore: item.relevanceScore,
-        volatilityImpact: item.volatilityImpact,
-        confidence: item.confidence,
-        tags: item.tags,
-        category: item.category,
-        affectedAssetClass: item.affectedAssetClasses,
-        rawPayloadRef: item.rawPayloadRef,
-        reasoningLog: asJson(item.reasoningLog),
-        dedupeHash: item.dedupeHash,
-        status: item.status,
-      },
-    }));
+  if (!row) return null;
+  return typeof row.value === "string" ? row.value : null;
+}
 
-  await prisma.symbolNewsLink.upsert({
-    where: {
-      newsItemId_symbolId: {
-        newsItemId: newsItem.id,
-        symbolId: symbolRecord.id,
-      },
+async function setLatestArticleId(articleId: string): Promise<void> {
+  await prisma.systemSetting.upsert({
+    where: { key: CURSOR_SETTING_KEY },
+    update: {
+      value: articleId,
+      valueType: "string",
+      description: "Latest Polygon news article id processed by worker-news",
     },
-    update: { relevanceScore: item.relevanceScore },
     create: {
-      newsItemId: newsItem.id,
-      symbolId: symbolRecord.id,
-      relevanceScore: item.relevanceScore,
-      reasoning: "News intelligence worker linked symbol context.",
+      key: CURSOR_SETTING_KEY,
+      value: articleId,
+      valueType: "string",
+      description: "Latest Polygon news article id processed by worker-news",
     },
   });
+}
 
-  return newsItem;
-};
+async function sendToDiscord(article: PolygonNewsArticle): Promise<boolean> {
+  if (!DISCORD_WEBHOOK_URL) {
+    logger.warn("DISCORD_WEBHOOK_URL is not configured; suppressing news alert");
+    return true;
+  }
 
-const processSweep = async (sweepType: "urgent" | "broad") => {
+  const payload = {
+    embeds: [
+      {
+        title: article.title,
+        url: article.article_url,
+        description: article.description?.slice(0, 4000),
+        author: { name: article.publisher?.name || "Polygon News" },
+        ...(article.image_url ? { image: { url: article.image_url } } : {}),
+        timestamp: new Date(article.published_utc).toISOString(),
+        footer: {
+          text: `Tickers: ${article.tickers?.join(", ") || "N/A"}`,
+        },
+        color: 0x00a3e0,
+      },
+    ],
+  };
+
+  try {
+    const res = await fetchWithTimeout(
+      DISCORD_WEBHOOK_URL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+      10000,
+    );
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      logger.error("Discord webhook rejected payload", {
+        status: res.status,
+        body,
+        articleId: article.id,
+      });
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    logger.error("Failed to send article to Discord", {
+      articleId: article.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function fetchPolygonNews(): Promise<PolygonNewsArticle[]> {
+  if (!MASSIVE_API_KEY) {
+    throw new Error("MASSIVE_API_KEY is not defined");
+  }
+
+  const url =
+    `https://api.polygon.io/v2/reference/news` +
+    `?limit=${NEWS_LIMIT}` +
+    `&sort=published_utc` +
+    `&order=desc` +
+    `&apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+
+  const res = await fetchWithTimeout(url, {}, 15000);
+
+  if (!res.ok) {
+    throw new Error(`Polygon API error: ${res.status} ${res.statusText}`);
+  }
+
+  const data = (await res.json()) as PolygonNewsResponse;
+  return data.results ?? [];
+}
+
+async function pollNews(trigger: "startup" | "interval") {
   const run = await createWorkerRun({
     workerType: "NEWS",
     queueName: queueNames.news,
-    jobName: sweepType,
-    payload: { sweepType },
+    jobName: trigger === "startup" ? "startupPoll" : "intervalPoll",
+    payload: { trigger },
   });
 
   try {
@@ -79,93 +179,120 @@ const processSweep = async (sweepType: "urgent" | "broad") => {
       workerType: "NEWS",
       serviceName: "worker-news",
       status: "running",
-      currentTask: `${sweepType}-sweep`,
+      currentTask: trigger === "startup" ? "startup-poll" : "polling-polygon",
     });
 
-    const symbols = sweepType === "urgent" ? config.watchlistSymbols.slice(0, 5) : config.watchlistSymbols;
-    const macroItems = await provider.getMacroNews(sweepType === "urgent" ? 2 : 5);
-    let stored = 0;
-    let highUrgency = 0;
+    const results = await fetchPolygonNews();
+    logger.info("Fetched Polygon news", {
+      count: results.length,
+      trigger,
+    });
 
-    for (const macro of macroItems) {
-      const scored = scoreNewsIntelligence({
-        source: macro.source,
-        headline: macro.headline,
-        summary: macro.summary ?? "",
-        originalTimestamp: macro.publishedAt,
-        affectedSymbols: [macro.symbol],
-        affectedAssetClasses: [macro.symbol.endsWith("USD") ? "FX" : "INDEX"],
-        tags: macro.tags ?? [],
-        category: "macro",
-        rawPayloadRef: macro.url,
-      });
-      await upsertNewsItem(macro.symbol, scored);
-      stored += 1;
-      if (["HIGH", "CRITICAL"].includes(scored.urgency)) highUrgency += 1;
-    }
-
-    for (const symbol of symbols) {
-      const items = await provider.getNews(symbol, sweepType === "urgent" ? 1 : 3);
-      for (const item of items) {
-        const scored = scoreNewsIntelligence({
-          source: item.source,
-          headline: item.headline,
-          summary: item.summary ?? "",
-          originalTimestamp: item.publishedAt,
-          affectedSymbols: [symbol],
-          affectedAssetClasses: [symbol.endsWith("USD") ? "FX" : "EQUITY"],
-          tags: item.tags ?? [],
-          category: "symbol-specific",
-          rawPayloadRef: item.url,
-        });
-        await upsertNewsItem(symbol, scored);
-        stored += 1;
-        if (["HIGH", "CRITICAL"].includes(scored.urgency)) highUrgency += 1;
-      }
-    }
-
-    if (highUrgency > 0) {
-      await queueNotification({
-        category: "market_news",
-        severity: "warning",
-        title: "High urgency news detected",
-        body: `${highUrgency} high urgency news item(s) were ingested during the ${sweepType} sweep.`,
-        dedupeKey: `news-${sweepType}-${new Date().toISOString().slice(0, 16)}`,
-        metadata: { sweepType, highUrgency },
-      });
-    }
-
-    await prisma.auditLog.create({
-      data: {
-        actorType: "WORKER",
-        actorId: "worker-news",
+    if (results.length === 0) {
+      await completeWorkerRun(run.id, "No news returned", { fetched: 0, newArticles: 0 });
+      await upsertWorkerHeartbeat({
         workerType: "NEWS",
-        severity: "INFO",
-        category: "worker.news",
-        message: `News sweep completed with ${stored} stored items.`,
-        entityType: "worker_run",
-        entityId: run.id,
-        data: { stored, sweepType },
-      },
+        serviceName: "worker-news",
+        status: "healthy",
+        currentTask: "idle",
+        metrics: { fetched: 0, newArticles: 0 },
+      });
+      return;
+    }
+
+    let latestArticleId = await getLatestArticleId();
+
+    if (!latestArticleId) {
+      latestArticleId = results[0].id;
+      await setLatestArticleId(latestArticleId);
+
+      logger.info("Initialized latest Polygon article cursor", {
+        latestArticleId,
+      });
+
+      if (SEND_LATEST_ON_STARTUP && results[0]) {
+        logger.info("SEND_LATEST_ON_STARTUP enabled; sending latest article");
+        await sendToDiscord(results[0]);
+      }
+
+      await completeWorkerRun(run.id, "Initialized cursor", {
+        fetched: results.length,
+        initializedTo: latestArticleId,
+      });
+
+      await upsertWorkerHeartbeat({
+        workerType: "NEWS",
+        serviceName: "worker-news",
+        status: "healthy",
+        currentTask: "idle",
+        metrics: { fetched: results.length, initialized: true },
+      });
+
+      return;
+    }
+
+    const unseen: PolygonNewsArticle[] = [];
+    for (const article of results) {
+      if (article.id === latestArticleId) break;
+      unseen.push(article);
+    }
+
+    logger.info("Computed unseen Polygon articles", {
+      previousLatestArticleId: latestArticleId,
+      unseenCount: unseen.length,
     });
 
-    await completeWorkerRun(run.id, `${stored} items stored`, { stored, highUrgency });
+    let sentCount = 0;
+    let newestProcessedId: string | null = latestArticleId;
+
+    for (const article of unseen.reverse()) {
+      logger.info("Dispatching Polygon article", {
+        articleId: article.id,
+        title: article.title,
+      });
+
+      const ok = await sendToDiscord(article);
+      if (!ok) {
+        break;
+      }
+
+      newestProcessedId = article.id;
+      sentCount += 1;
+    }
+
+    if (newestProcessedId && newestProcessedId !== latestArticleId) {
+      await setLatestArticleId(newestProcessedId);
+    }
+
+    await completeWorkerRun(run.id, `${sentCount} news alerts sent`, {
+      fetched: results.length,
+      unseenCount: unseen.length,
+      sentCount,
+      latestArticleId: newestProcessedId,
+    });
+
     await upsertWorkerHeartbeat({
       workerType: "NEWS",
       serviceName: "worker-news",
       status: "healthy",
       currentTask: "idle",
-      metrics: { stored, highUrgency },
+      metrics: {
+        fetched: results.length,
+        unseenCount: unseen.length,
+        sentCount,
+      },
     });
   } catch (error) {
     const err = error as Error;
+
     await failWorkerRun({
       runId: run.id,
       workerType: "NEWS",
       message: err.message,
       stack: err.stack,
-      payload: { sweepType },
+      payload: { trigger },
     });
+
     await upsertWorkerHeartbeat({
       workerType: "NEWS",
       serviceName: "worker-news",
@@ -173,21 +300,57 @@ const processSweep = async (sweepType: "urgent" | "broad") => {
       currentTask: "error",
       metrics: { error: err.message },
     });
-    throw error;
+
+    logger.error("News poll failed", {
+      trigger,
+      error: err.message,
+    });
   }
-};
+}
 
-setInterval(() => {
-  void upsertWorkerHeartbeat({
-    workerType: "NEWS",
-    serviceName: "worker-news",
-    status: "healthy",
-    currentTask: "idle",
+async function runPoll(trigger: "startup" | "interval") {
+  if (isRunning) {
+    logger.warn("Skipping overlapping news poll", { trigger });
+    return;
+  }
+
+  isRunning = true;
+  try {
+    await pollNews(trigger);
+  } finally {
+    isRunning = false;
+  }
+}
+
+async function start() {
+  ensurePositiveNumber(POLLING_INTERVAL, "NEWS_URGENT_INTERVAL_MS");
+  ensurePositiveNumber(NEWS_LIMIT, "NEWS_LIMIT");
+
+  logger.info("Starting Polygon.io news worker", {
+    pollingIntervalMs: POLLING_INTERVAL,
+    newsLimit: NEWS_LIMIT,
   });
-}, 15_000);
 
-createPlatformWorker<{ sweepType: "urgent" | "broad" }>(queueNames.news, "worker-news", async (payload) => {
-  await processSweep(payload.sweepType);
+  process.on("SIGTERM", () => {
+    logger.warn("worker-news received SIGTERM");
+    process.exit(0);
+  });
+
+  process.on("SIGINT", () => {
+    logger.warn("worker-news received SIGINT");
+    process.exit(0);
+  });
+
+  await runPoll("startup");
+
+  for await (const _ of setInterval(POLLING_INTERVAL)) {
+    await runPoll("interval");
+  }
+}
+
+start().catch((error) => {
+  logger.error("worker-news failed to start", {
+    error: error instanceof Error ? error.message : String(error),
+  });
+  process.exit(1);
 });
-
-logger.info("News worker started");

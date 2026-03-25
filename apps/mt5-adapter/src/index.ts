@@ -30,6 +30,21 @@ const state = {
   closedPositions: [] as Array<Record<string, unknown>>,
 };
 
+const resolveMidPrice = (symbol: string, providedMid?: number) => {
+  if (typeof providedMid === "number" && Number.isFinite(providedMid) && providedMid > 0) {
+    return providedMid;
+  }
+
+  const symbolBias = 95 + symbol.length * 3 + symbol.charCodeAt(0) % 17;
+  return Number(symbolBias.toFixed(4));
+};
+
+const getSpreadPct = (symbol: string) => {
+  const base = symbol.endsWith("USD") ? 0.018 : symbol.length % 2 === 0 ? 0.028 : 0.034;
+  const connectionPenalty = state.connected ? 1 : 1.35;
+  return Number((base * connectionPenalty).toFixed(4));
+};
+
 app.get("/health", async () => ({
   ok: true,
   connected: state.connected,
@@ -58,6 +73,23 @@ app.get("/account", async () => state.account);
 app.get("/positions", async () => state.positions);
 app.get("/orders", async () => state.orders);
 app.get("/history", async () => state.closedPositions);
+app.get("/quote/:symbol", async (request) => {
+  const { symbol } = request.params as { symbol: string };
+  const query = request.query as { mid?: string };
+  const requestedMid = query.mid ? Number(query.mid) : undefined;
+  const mid = resolveMidPrice(symbol, requestedMid);
+  const spreadPct = getSpreadPct(symbol);
+  const halfSpread = (mid * spreadPct) / 200;
+
+  return {
+    symbol,
+    bid: Number((mid - halfSpread).toFixed(5)),
+    ask: Number((mid + halfSpread).toFixed(5)),
+    mid: Number(mid.toFixed(5)),
+    spreadPct,
+    connected: state.connected,
+  };
+});
 
 app.post("/orders", async (request, reply) => {
   if (!state.connected) {

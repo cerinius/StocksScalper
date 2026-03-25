@@ -4,12 +4,12 @@ import type { DiscordNotificationPayload } from "@stock-radar/types";
 import { Queue, Worker } from "bullmq";
 
 export const queueNames = {
-  news: "queue:news-intelligence",
-  market: "queue:market-analysis",
-  validation: "queue:validation",
-  execution: "queue:execution",
-  supervisor: "queue:supervisor",
-  notifications: "queue:notifications",
+  news: "queue-news-intelligence",
+  market: "queue-market-analysis",
+  validation: "queue-validation",
+  execution: "queue-execution",
+  supervisor: "queue-supervisor",
+  notifications: "queue-notifications",
 } as const;
 
 export type QueueName = (typeof queueNames)[keyof typeof queueNames];
@@ -95,39 +95,72 @@ export const createPlatformWorker = <T>(queueName: QueueName, serviceName: strin
   return worker;
 };
 
+const syncRepeatableJob = async <T extends object>(
+  queue: Queue,
+  name: string,
+  data: T,
+  repeat: { every?: number; pattern?: string },
+  jobId: string,
+) => {
+  const repeatableJobs = await queue.getRepeatableJobs();
+  const existingJobs = repeatableJobs.filter((job) => job.name === name);
+
+  for (const job of existingJobs) {
+    const sameEvery = typeof repeat.every === "number" && Number(job.every) === repeat.every;
+    const samePattern = typeof repeat.pattern === "string" && job.pattern === repeat.pattern;
+    if (sameEvery || samePattern) continue;
+
+    await queue.removeRepeatableByKey(job.key);
+  }
+
+  return queue.add(name, data, {
+    repeat,
+    jobId,
+  });
+};
+
 export const ensureDefaultSchedules = async () => {
   const config = getPlatformConfig();
   const queues = createPlatformQueues();
   const logger = createLogger("scheduler");
 
-  await queues.news.add("urgentSweep", { sweepType: "urgent" } satisfies NewsQueuePayload, {
-    repeat: { every: config.schedules.newsUrgentMs },
-    jobId: "news-urgent-repeat",
-  });
-  await queues.news.add("broadSweep", { sweepType: "broad" } satisfies NewsQueuePayload, {
-    repeat: { every: config.schedules.newsBroadMs },
-    jobId: "news-broad-repeat",
-  });
-  await queues.market.add("scanWatchlist", {} satisfies MarketQueuePayload, {
-    repeat: { every: config.schedules.marketScanMs },
-    jobId: "market-repeat",
-  });
-  await queues.validation.add("periodicValidation", { trigger: "periodic_rescore" } satisfies ValidationQueuePayload, {
-    repeat: { every: config.schedules.validationMs },
-    jobId: "validation-repeat",
-  });
-  await queues.execution.add("executionLoop", { trigger: "periodic_loop" } satisfies ExecutionQueuePayload, {
-    repeat: { every: config.schedules.executionMs },
-    jobId: "execution-repeat",
-  });
-  await queues.supervisor.add("healthCheck", { trigger: "health_check" } satisfies SupervisorQueuePayload, {
-    repeat: { every: config.schedules.supervisorMs },
-    jobId: "supervisor-repeat",
-  });
-  await queues.supervisor.add("dailySummary", { trigger: "daily_summary" } satisfies SupervisorQueuePayload, {
-    repeat: { pattern: config.schedules.dailySummaryCron },
-    jobId: "supervisor-daily-summary",
-  });
+  await syncRepeatableJob(queues.news, "urgentSweep", { sweepType: "urgent" } satisfies NewsQueuePayload, {
+    every: config.schedules.newsUrgentMs,
+  }, "news-urgent-repeat");
+  await syncRepeatableJob(queues.news, "broadSweep", { sweepType: "broad" } satisfies NewsQueuePayload, {
+    every: config.schedules.newsBroadMs,
+  }, "news-broad-repeat");
+  await syncRepeatableJob(queues.market, "scanWatchlist", {} satisfies MarketQueuePayload, {
+    every: config.schedules.marketScanMs,
+  }, "market-repeat");
+  await syncRepeatableJob(
+    queues.validation,
+    "periodicValidation",
+    { trigger: "periodic_rescore" } satisfies ValidationQueuePayload,
+    { every: config.schedules.validationMs },
+    "validation-repeat",
+  );
+  await syncRepeatableJob(
+    queues.execution,
+    "executionLoop",
+    { trigger: "periodic_loop" } satisfies ExecutionQueuePayload,
+    { every: config.schedules.executionMs },
+    "execution-repeat",
+  );
+  await syncRepeatableJob(
+    queues.supervisor,
+    "healthCheck",
+    { trigger: "health_check" } satisfies SupervisorQueuePayload,
+    { every: config.schedules.supervisorMs },
+    "supervisor-repeat",
+  );
+  await syncRepeatableJob(
+    queues.supervisor,
+    "dailySummary",
+    { trigger: "daily_summary" } satisfies SupervisorQueuePayload,
+    { pattern: config.schedules.dailySummaryCron },
+    "supervisor-daily-summary",
+  );
 
   logger.info("Default schedules ensured");
 };

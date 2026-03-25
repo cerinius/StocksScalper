@@ -29,6 +29,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
@@ -41,11 +43,6 @@ services:
       MT5_ADAPTER_URL: http://mt5-adapter:4310
       NEXT_PUBLIC_API_BASE: http://localhost:4210
       NEXT_PUBLIC_GATEWAY_BASE: http://localhost:4211
-      TRADINGVIEW_WEBHOOK_SECRET: ${TRADINGVIEW_WEBHOOK_SECRET:-local-tv-secret}
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
-      TRADING_MODE: ${TRADING_MODE:-paper}
-      MANUAL_APPROVAL_MODE: ${MANUAL_APPROVAL_MODE:-false}
-      KILL_SWITCH: ${KILL_SWITCH:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,6 +60,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.gateway
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
@@ -82,9 +81,10 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.mt5-adapter
+    env_file:
+      - .env.local
     environment:
       MT5_ADAPTER_PORT: 4310
-      TRADING_MODE: ${TRADING_MODE:-paper}
     ports:
       - "${MT5_ADAPTER_PORT:-4310}:4310"
     healthcheck:
@@ -97,10 +97,11 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker-news
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
     depends_on:
       api:
         condition: service_healthy
@@ -109,9 +110,12 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker-market
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
+      DATA_PROVIDER: ${DATA_PROVIDER:-massive}
     depends_on:
       api:
         condition: service_healthy
@@ -120,6 +124,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker-validation
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
@@ -131,12 +137,12 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker-execution
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
       MT5_ADAPTER_URL: http://mt5-adapter:4310
-      TRADING_MODE: ${TRADING_MODE:-paper}
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
     depends_on:
       api:
         condition: service_healthy
@@ -147,11 +153,11 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker-supervisor
+    env_file:
+      - .env.local
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
-      SUPERVISOR_INTERVAL_MS: ${SUPERVISOR_INTERVAL_MS:-20000}
     depends_on:
       api:
         condition: service_healthy
@@ -160,6 +166,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.web
+    env_file:
+      - .env.local
     environment:
       WEB_PORT: 3210
       NEXT_PUBLIC_API_BASE: http://localhost:4210

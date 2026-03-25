@@ -13,6 +13,14 @@ const envSchema = z.object({
   APP_NAME: z.string().default("stocks-scalper-platform"),
   DATABASE_URL: z.string().default("postgresql://stockradar:stockradar@localhost:55432/stockradar"),
   REDIS_URL: z.string().default("redis://localhost:56379"),
+  DATA_PROVIDER: z.enum(["mock", "massive"]).default("mock"),
+  MASSIVE_API_KEY: z.string().optional().default(""),
+  MASSIVE_REST_BASE_URL: z.string().default("https://api.massive.com"),
+  MASSIVE_WS_STOCKS_URL: z.string().default("wss://socket.massive.com/stocks"),
+  MASSIVE_WS_FOREX_URL: z.string().default("wss://socket.massive.com/forex"),
+  MASSIVE_WS_CRYPTO_URL: z.string().default("wss://socket.massive.com/crypto"),
+  MASSIVE_STREAM_MIN_MOVE_PCT: z.coerce.number().positive().default(0.12),
+  MASSIVE_STREAM_COOLDOWN_MS: z.coerce.number().int().positive().default(15_000),
   API_PORT: z.coerce.number().int().positive().default(4210),
   WEB_PORT: z.coerce.number().int().positive().default(3210),
   GATEWAY_PORT: z.coerce.number().int().positive().default(4211),
@@ -26,7 +34,7 @@ const envSchema = z.object({
   NEXT_PUBLIC_GATEWAY_BASE: z.string().default("http://localhost:4211"),
   DISCORD_WEBHOOK_URL: z.string().optional().default(""),
   TRADINGVIEW_WEBHOOK_SECRET: z.string().default("local-tv-secret"),
-  WATCHLIST_SYMBOLS: z.string().default("AAPL,MSFT,NVDA,AMD,TSLA,SPY,QQQ,EURUSD,XAUUSD"),
+  WATCHLIST_SYMBOLS: z.string().default("AAPL,MSFT,NVDA,AMD,TSLA,SPY,QQQ,EURUSD,XAUUSD,BTCUSD,ETHUSD"),
   WATCHLIST_TIMEFRAMES: z.string().default("1m,5m,15m,1h,1d"),
   NEWS_URGENT_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   NEWS_BROAD_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
@@ -45,6 +53,14 @@ const envSchema = z.object({
   MAX_TOTAL_EXPOSURE_PCT: z.coerce.number().positive().default(20),
   MAX_SYMBOL_EXPOSURE_PCT: z.coerce.number().positive().default(8),
   MAX_CORRELATED_EXPOSURE_PCT: z.coerce.number().positive().default(12),
+  MAX_ENTRY_SPREAD_PCT: z.coerce.number().positive().default(0.08),
+  CORRELATION_BLOCK_THRESHOLD: z.coerce.number().positive().max(1).default(0.85),
+  CORRELATION_LOOKBACK_BARS: z.coerce.number().int().positive().default(40),
+  MONTE_CARLO_SIMULATIONS: z.coerce.number().int().positive().default(2000),
+  MONTE_CARLO_RUIN_DRAWDOWN_PCT: z.coerce.number().positive().default(20),
+  MIN_DYNAMIC_RISK_PER_TRADE_PCT: z.coerce.number().positive().default(0.25),
+  RISK_THROTTLE_STEP_PCT: z.coerce.number().positive().default(0.1),
+  RISK_THROTTLE_COOLDOWN_MINUTES: z.coerce.number().int().positive().default(60),
   COOLDOWN_AFTER_LOSSES: z.coerce.number().int().positive().default(2),
   COOLDOWN_MINUTES: z.coerce.number().int().positive().default(45),
   STALE_SIGNAL_SECONDS: z.coerce.number().int().positive().default(300),
@@ -57,6 +73,7 @@ export interface PlatformConfig {
   nodeEnv: "development" | "test" | "production";
   databaseUrl: string;
   redisUrl: string;
+  dataProvider: "mock" | "massive";
   ports: {
     api: number;
     web: number;
@@ -76,6 +93,19 @@ export interface PlatformConfig {
   tradingViewWebhookSecret: string;
   watchlistSymbols: string[];
   watchlistTimeframes: Timeframe[];
+  marketData: {
+    massive: {
+      apiKey: string;
+      restBaseUrl: string;
+      websocketUrls: {
+        stocks: string;
+        forex: string;
+        crypto: string;
+      };
+      streamMinMovePct: number;
+      streamCooldownMs: number;
+    };
+  };
   schedules: {
     newsUrgentMs: number;
     newsBroadMs: number;
@@ -98,6 +128,14 @@ export interface PlatformConfig {
     maxTotalExposurePct: number;
     maxSymbolExposurePct: number;
     maxCorrelatedExposurePct: number;
+    maxEntrySpreadPct: number;
+    correlationBlockThreshold: number;
+    correlationLookbackBars: number;
+    monteCarloSimulations: number;
+    monteCarloRuinDrawdownPct: number;
+    minDynamicRiskPerTradePct: number;
+    riskThrottleStepPct: number;
+    riskThrottleCooldownMinutes: number;
     cooldownAfterLosses: number;
     cooldownMinutes: number;
     staleSignalSeconds: number;
@@ -127,6 +165,7 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
     nodeEnv: parsed.NODE_ENV,
     databaseUrl: parsed.DATABASE_URL,
     redisUrl: parsed.REDIS_URL,
+    dataProvider: parsed.DATA_PROVIDER,
     ports: {
       api: parsed.API_PORT,
       web: parsed.WEB_PORT,
@@ -146,6 +185,19 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
     tradingViewWebhookSecret: parsed.TRADINGVIEW_WEBHOOK_SECRET,
     watchlistSymbols: splitCsv(parsed.WATCHLIST_SYMBOLS),
     watchlistTimeframes: parseTimeframes(parsed.WATCHLIST_TIMEFRAMES),
+    marketData: {
+      massive: {
+        apiKey: parsed.MASSIVE_API_KEY,
+        restBaseUrl: parsed.MASSIVE_REST_BASE_URL,
+        websocketUrls: {
+          stocks: parsed.MASSIVE_WS_STOCKS_URL,
+          forex: parsed.MASSIVE_WS_FOREX_URL,
+          crypto: parsed.MASSIVE_WS_CRYPTO_URL,
+        },
+        streamMinMovePct: parsed.MASSIVE_STREAM_MIN_MOVE_PCT,
+        streamCooldownMs: parsed.MASSIVE_STREAM_COOLDOWN_MS,
+      },
+    },
     schedules: {
       newsUrgentMs: parsed.NEWS_URGENT_INTERVAL_MS,
       newsBroadMs: parsed.NEWS_BROAD_INTERVAL_MS,
@@ -168,6 +220,14 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
       maxTotalExposurePct: parsed.MAX_TOTAL_EXPOSURE_PCT,
       maxSymbolExposurePct: parsed.MAX_SYMBOL_EXPOSURE_PCT,
       maxCorrelatedExposurePct: parsed.MAX_CORRELATED_EXPOSURE_PCT,
+      maxEntrySpreadPct: parsed.MAX_ENTRY_SPREAD_PCT,
+      correlationBlockThreshold: parsed.CORRELATION_BLOCK_THRESHOLD,
+      correlationLookbackBars: parsed.CORRELATION_LOOKBACK_BARS,
+      monteCarloSimulations: parsed.MONTE_CARLO_SIMULATIONS,
+      monteCarloRuinDrawdownPct: parsed.MONTE_CARLO_RUIN_DRAWDOWN_PCT,
+      minDynamicRiskPerTradePct: parsed.MIN_DYNAMIC_RISK_PER_TRADE_PCT,
+      riskThrottleStepPct: parsed.RISK_THROTTLE_STEP_PCT,
+      riskThrottleCooldownMinutes: parsed.RISK_THROTTLE_COOLDOWN_MINUTES,
       cooldownAfterLosses: parsed.COOLDOWN_AFTER_LOSSES,
       cooldownMinutes: parsed.COOLDOWN_MINUTES,
       staleSignalSeconds: parsed.STALE_SIGNAL_SECONDS,

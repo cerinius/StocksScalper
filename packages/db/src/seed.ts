@@ -386,6 +386,7 @@ async function main() {
           maxTotalExposurePct: config.risk.maxTotalExposurePct,
           maxSymbolExposurePct: config.risk.maxSymbolExposurePct,
           maxCorrelatedExposurePct: config.risk.maxCorrelatedExposurePct,
+          maxEntrySpreadPct: config.risk.maxEntrySpreadPct,
           staleSignalSeconds: config.risk.staleSignalSeconds,
           manualApprovalMode: config.trading.manualApprovalMode,
         },

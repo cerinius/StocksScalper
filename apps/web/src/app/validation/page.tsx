@@ -11,6 +11,12 @@ interface ValidationItem {
   winRateEstimate: number;
   expectancy: number;
   sampleSize: number;
+  backtestMetadata?: {
+    monteCarlo?: {
+      drawdownPct95?: number;
+      riskOfRuinPct?: number;
+    };
+  };
   candidate: { symbol: { ticker: string }; strategyType: string; timeframe: string };
   backtestResults: Array<{ id: string; similarityScore: number; outcomeR: number; holdBars: number }>;
 }
@@ -36,6 +42,8 @@ export default function ValidationPage() {
               <th>Score</th>
               <th>Win Rate</th>
               <th>Expectancy</th>
+              <th>MC DD95</th>
+              <th>Ruin Risk</th>
               <th>Sample</th>
             </tr>
           </thead>
@@ -49,6 +57,12 @@ export default function ValidationPage() {
                 <td>{item.finalValidationScore.toFixed(1)}</td>
                 <td>{(item.winRateEstimate * 100).toFixed(1)}%</td>
                 <td>{item.expectancy.toFixed(2)}R</td>
+                <td>{item.backtestMetadata?.monteCarlo?.drawdownPct95?.toFixed(1) ?? "-"}%</td>
+                <td>
+                  {item.backtestMetadata?.monteCarlo?.riskOfRuinPct !== undefined
+                    ? `${((item.backtestMetadata?.monteCarlo?.riskOfRuinPct ?? 0) * 100).toFixed(1)}%`
+                    : "-"}
+                </td>
                 <td>{item.sampleSize}</td>
               </tr>
             ))}

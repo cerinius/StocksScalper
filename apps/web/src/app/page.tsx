@@ -20,6 +20,7 @@ interface DashboardData {
   riskWarnings: Array<{ id: string; eventType: string; message: string; severity: string; createdAt: string; blocking: boolean }>;
   workerHealth: Array<{ workerType: string; status: string; currentTask: string | null; lastSeenAt: string }>;
   killSwitchActive: boolean;
+  dynamicMaxRiskPerTradePct: number | null;
 }
 
 export default function DashboardPage() {
@@ -42,6 +43,7 @@ export default function DashboardPage() {
         <MetricCard label="Drawdown" value={formatPercent(data?.account?.drawdownPct)} tone={(data?.account?.drawdownPct ?? 0) >= 2 ? "warn" : "default"} />
         <MetricCard label="Active Trades" value={data?.activeTrades ?? 0} />
         <MetricCard label="Kill Switch" value={data?.killSwitchActive ? "Active" : "Clear"} tone={data?.killSwitchActive ? "critical" : "good"} />
+        <MetricCard label="Risk / Trade" value={data?.dynamicMaxRiskPerTradePct ? `${data.dynamicMaxRiskPerTradePct.toFixed(2)}%` : "Base"} tone={(data?.dynamicMaxRiskPerTradePct ?? 0.75) < 0.75 ? "warn" : "default"} />
       </div>
 
       <div className="panel-grid">

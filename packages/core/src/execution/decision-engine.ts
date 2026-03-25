@@ -7,6 +7,7 @@ import type {
   ValidationMetrics,
 } from "@stock-radar/types";
 import { buildReasoningLog, clamp } from "@stock-radar/shared";
+import { calculateHalfKellyMultiplier } from "../risk/kelly";
 
 export interface DecisionContext {
   candidate: TradeCandidateRecord;
@@ -20,8 +21,15 @@ export interface DecisionContext {
     maxTotalExposurePct: number;
     maxSymbolExposurePct: number;
     maxCorrelatedExposurePct: number;
+    maxEntrySpreadPct: number;
     staleSignalSeconds: number;
     manualApprovalMode: boolean;
+    dynamicRiskPerTradePct?: number;
+  };
+  marketContext?: {
+    spreadPct?: number | null;
+    correlatedExposurePct?: number;
+    correlatedSymbols?: string[];
   };
   references: SupportingReference[];
 }
@@ -37,7 +45,7 @@ const computeCorrelationExposure = (positions: ExecutionPositionSnapshot[], tags
 const secondsSince = (dateValue: string) => (Date.now() - new Date(dateValue).getTime()) / 1_000;
 
 export const makeExecutionDecision = (context: DecisionContext): StructuredDecision => {
-  const { candidate, validation, account, openPositions, riskLimits } = context;
+  const { candidate, validation, account, openPositions, riskLimits, marketContext } = context;
   const blockingReasons = [];
 
   if (account.killSwitchActive) {
@@ -89,13 +97,29 @@ export const makeExecutionDecision = (context: DecisionContext): StructuredDecis
     });
   }
 
-  const correlatedExposure = computeCorrelationExposure(openPositions, candidate.correlationTags);
+  const tagCorrelatedExposure = computeCorrelationExposure(openPositions, candidate.correlationTags);
+  const observedCorrelatedExposure = marketContext?.correlatedExposurePct ?? 0;
+  const correlatedExposure = Math.max(tagCorrelatedExposure, observedCorrelatedExposure);
   if (correlatedExposure >= riskLimits.maxCorrelatedExposurePct) {
     blockingReasons.push({
       title: "Correlated exposure too high",
-      detail: `Correlation bucket exposure is ${correlatedExposure.toFixed(2)}%.`,
+      detail:
+        observedCorrelatedExposure > tagCorrelatedExposure && (marketContext?.correlatedSymbols?.length ?? 0) > 0
+          ? `Observed exposure against ${marketContext?.correlatedSymbols?.join(", ")} is ${correlatedExposure.toFixed(2)}%.`
+          : `Correlation bucket exposure is ${correlatedExposure.toFixed(2)}%.`,
       weight: 0.76,
       tags: ["correlation"],
+    });
+  }
+
+  if ((marketContext?.spreadPct ?? 0) >= riskLimits.maxEntrySpreadPct) {
+    blockingReasons.push({
+      title: "Entry spread too wide",
+      detail: `Estimated spread is ${marketContext?.spreadPct?.toFixed(3)}%, above the ${riskLimits.maxEntrySpreadPct.toFixed(
+        3,
+      )}% cap.`,
+      weight: 0.78,
+      tags: ["spread", "execution_cost"],
     });
   }
 
@@ -120,6 +144,16 @@ export const makeExecutionDecision = (context: DecisionContext): StructuredDecis
     0,
     100,
   );
+  const kellyMultiplier = calculateHalfKellyMultiplier({
+    winRateEstimate: validation?.winRateEstimate,
+    riskReward: candidate.riskReward,
+    confidenceScore: validation?.confidenceScore ?? candidate.confidenceScore,
+  });
+  const effectiveRiskPerTradePct = Math.min(
+    riskLimits.dynamicRiskPerTradePct ?? riskLimits.maxRiskPerTradePct,
+    riskLimits.maxRiskPerTradePct,
+  );
+  const sizedRiskPerTradePct = effectiveRiskPerTradePct * kellyMultiplier;
 
   const action =
     blockingReasons.length > 0
@@ -132,7 +166,9 @@ export const makeExecutionDecision = (context: DecisionContext): StructuredDecis
           ? "PLACE"
           : "HOLD";
 
-  const quantity = Number(((account.balance * (riskLimits.maxRiskPerTradePct / 100)) / Math.max(candidate.currentPrice * 0.01, 1)).toFixed(3));
+  const quantity = Number(
+    ((account.balance * (sizedRiskPerTradePct / 100)) / Math.max(candidate.currentPrice * 0.01, 1)).toFixed(3),
+  );
 
   return {
     action,
@@ -164,6 +200,12 @@ export const makeExecutionDecision = (context: DecisionContext): StructuredDecis
         )}%.`,
         weight: clamp(1 - riskScore / 100, 0.2, 0.9),
         tags: ["portfolio", account.riskState.toLowerCase()],
+      },
+      {
+        title: "Position sizing",
+        detail: `Sizing uses ${sizedRiskPerTradePct.toFixed(3)}% risk per trade after dynamic throttle and half-Kelly adjustment.`,
+        weight: clamp(sizedRiskPerTradePct / Math.max(riskLimits.maxRiskPerTradePct, 0.01), 0.25, 0.8),
+        tags: ["sizing", "kelly"],
       },
     ]),
     blockingReasons: buildReasoningLog(blockingReasons),
