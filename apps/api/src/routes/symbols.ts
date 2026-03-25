@@ -24,15 +24,21 @@ export const symbolRoutes = async (app: FastifyInstance) => {
     const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
     if (!symbol) return null;
 
-    const latestFeature = await prisma.featureDaily.findFirst({
+    const latestPriceBar = await prisma.priceBar.findFirst({
       where: { symbolId: symbol.id },
-      orderBy: { date: "desc" },
+      orderBy: { timestamp: "desc" },
     });
-    const latestLevel = await prisma.levelMap.findFirst({
+
+    const latestSnapshot = await prisma.marketSnapshot.findFirst({
       where: { symbolId: symbol.id },
-      orderBy: { date: "desc" },
+      orderBy: { snapshotAt: "desc" },
     });
-    return { symbol, latestFeature, latestLevel };
+
+    return {
+      symbol,
+      latestPriceBar,
+      latestSnapshot,
+    };
   });
 
   app.get("/api/symbol/:ticker/daily", async (request) => {
@@ -41,15 +47,16 @@ export const symbolRoutes = async (app: FastifyInstance) => {
     const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
     if (!symbol) return [];
 
-    return prisma.dailyBar.findMany({
+    return prisma.priceBar.findMany({
       where: {
         symbolId: symbol.id,
-        date: {
+        timeframe: "1d",
+        timestamp: {
           gte: query.from ? new Date(query.from) : undefined,
           lte: query.to ? new Date(query.to) : undefined,
         },
       },
-      orderBy: { date: "asc" },
+      orderBy: { timestamp: "asc" },
     });
   });
 
@@ -61,16 +68,17 @@ export const symbolRoutes = async (app: FastifyInstance) => {
     const symbol = await prisma.symbol.findUnique({ where: { ticker: params.ticker } });
     if (!symbol) return [];
 
-    return prisma.intradayBar.findMany({
+    return prisma.priceBar.findMany({
       where: {
         symbolId: symbol.id,
         timeframe: query.tf,
-        ts: {
+        timestamp: {
           gte: query.from ? new Date(query.from) : undefined,
           lte: query.to ? new Date(query.to) : undefined,
         },
       },
-      orderBy: { ts: "asc" },
+      orderBy: { timestamp: "asc" },
+      take: 500,
     });
   });
 
@@ -83,9 +91,15 @@ export const symbolRoutes = async (app: FastifyInstance) => {
     const days = Number(query.days ?? "7");
     const since = new Date(Date.now() - days * 86_400_000);
 
-    return prisma.newsItem.findMany({
-      where: { symbolId: symbol.id, publishedAt: { gte: since } },
-      orderBy: { publishedAt: "desc" },
+    return prisma.symbolNewsLink.findMany({
+      where: {
+        symbolId: symbol.id,
+        newsItem: {
+          originalTimestamp: { gte: since },
+        },
+      },
+      include: { newsItem: true },
+      orderBy: { newsItem: { originalTimestamp: "desc" } },
     });
   });
 };

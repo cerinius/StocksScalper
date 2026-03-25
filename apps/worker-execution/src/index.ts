@@ -111,8 +111,29 @@ const getCorrelationContext = async (
   };
 };
 
+// Lazy MT5 integration ID lookup — avoids hardcoding seed-specific "seed-mt5" ID
+let cachedMt5IntegrationId: string | null | undefined;
+
+const getMt5IntegrationId = async (): Promise<string | null> => {
+  if (cachedMt5IntegrationId !== undefined) return cachedMt5IntegrationId;
+  const integration = await prisma.integration.findFirst({ where: { kind: "MT5", enabled: true } });
+  cachedMt5IntegrationId = integration?.id ?? null;
+  return cachedMt5IntegrationId;
+};
+
 const getAccountSnapshot = async () => {
-  const adapterResponse = await fetch(`${config.services.mt5AdapterUrl}/account`);
+  let adapterResponse: Response;
+  try {
+    adapterResponse = await fetch(`${config.services.mt5AdapterUrl}/account`);
+  } catch (err) {
+    throw new Error(`MT5 adapter unreachable at ${config.services.mt5AdapterUrl}/account: ${(err as Error).message}`);
+  }
+
+  if (!adapterResponse.ok) {
+    const body = await adapterResponse.text().catch(() => "");
+    throw new Error(`MT5 adapter returned ${adapterResponse.status} for /account: ${body.slice(0, 200)}`);
+  }
+
   const account = (await adapterResponse.json()) as {
     balance: number;
     equity: number;
@@ -127,9 +148,11 @@ const getAccountSnapshot = async () => {
     mode: "paper" | "live";
   };
 
+  const integrationId = await getMt5IntegrationId();
+
   await prisma.accountSnapshot.create({
     data: {
-      integrationId: "seed-mt5",
+      integrationId,
       capturedAt: new Date(),
       balance: account.balance,
       equity: account.equity,
@@ -186,6 +209,7 @@ const evaluateExecution = async (candidateId?: string) => {
     ]);
 
     let placed = 0;
+    const integrationId = await getMt5IntegrationId();
     for (const candidate of candidates) {
       const latestValidation = candidate.validationRuns[0];
       const [correlationContext, quote] = await Promise.all([
@@ -318,7 +342,7 @@ const evaluateExecution = async (candidateId?: string) => {
           await prisma.order.create({
             data: {
               symbolId: candidate.symbolId,
-              integrationId: "seed-mt5",
+              integrationId,
               decisionId: decisionRecord.id,
               broker: "mt5-adapter",
               brokerOrderId: orderResult.brokerOrderId,
@@ -369,7 +393,7 @@ const evaluateExecution = async (candidateId?: string) => {
         await prisma.order.create({
           data: {
             symbolId: candidate.symbolId,
-            integrationId: "seed-mt5",
+            integrationId,
             decisionId: decisionRecord.id,
             broker: "mt5-adapter",
             brokerOrderId: orderResult.brokerOrderId,

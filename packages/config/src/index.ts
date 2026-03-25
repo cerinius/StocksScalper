@@ -38,6 +38,8 @@ const envSchema = z.object({
   WATCHLIST_TIMEFRAMES: z.string().default("1m,5m,15m,1h,1d"),
   NEWS_URGENT_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   NEWS_BROAD_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
+  NEWS_LIMIT: z.coerce.number().int().positive().default(25),
+  SEND_LATEST_ON_STARTUP: booleanish.default(false),
   MARKET_SCAN_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   VALIDATION_INTERVAL_MS: z.coerce.number().int().positive().default(120_000),
   EXECUTION_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
@@ -65,7 +67,7 @@ const envSchema = z.object({
   COOLDOWN_MINUTES: z.coerce.number().int().positive().default(45),
   STALE_SIGNAL_SECONDS: z.coerce.number().int().positive().default(300),
   LOCAL_ADMIN_EMAIL: z.string().default("admin@stockradar.local"),
-  LOCAL_ADMIN_NAME: z.string().default("Local Admin")
+  LOCAL_ADMIN_NAME: z.string().default("Local Admin"),
 });
 
 export interface PlatformConfig {
@@ -93,6 +95,10 @@ export interface PlatformConfig {
   tradingViewWebhookSecret: string;
   watchlistSymbols: string[];
   watchlistTimeframes: Timeframe[];
+  news: {
+    limit: number;
+    sendLatestOnStartup: boolean;
+  };
   marketData: {
     massive: {
       apiKey: string;
@@ -185,6 +191,10 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
     tradingViewWebhookSecret: parsed.TRADINGVIEW_WEBHOOK_SECRET,
     watchlistSymbols: splitCsv(parsed.WATCHLIST_SYMBOLS),
     watchlistTimeframes: parseTimeframes(parsed.WATCHLIST_TIMEFRAMES),
+    news: {
+      limit: parsed.NEWS_LIMIT,
+      sendLatestOnStartup: parsed.SEND_LATEST_ON_STARTUP,
+    },
     marketData: {
       massive: {
         apiKey: parsed.MASSIVE_API_KEY,

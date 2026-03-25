@@ -4,35 +4,24 @@ import { prisma } from "@stock-radar/db";
 
 export const universeRoutes = async (app: FastifyInstance) => {
   app.get("/api/universe/current", async () => {
-    const latest = await prisma.universeSnapshot.findFirst({
-      orderBy: { snapshotDate: "desc" },
-      include: { items: { include: { symbol: true }, orderBy: { rank: "asc" } } },
-    });
-    return latest ?? { items: [] };
+    return prisma.symbol.findMany({ where: { isActive: true }, orderBy: { ticker: "asc" } });
   });
 
-  app.get("/api/universe/:date", async (request) => {
-    const params = z.object({ date: z.string() }).parse(request.params);
-    const snapshotDate = new Date(params.date);
-    return prisma.universeSnapshot.findFirst({
-      where: { snapshotDate },
-      include: { items: { include: { symbol: true }, orderBy: { rank: "asc" } } },
-    });
+  app.get("/api/universe/:ticker", async (request) => {
+    const params = z.object({ ticker: z.string() }).parse(request.params);
+    return prisma.symbol.findUnique({ where: { ticker: params.ticker } });
   });
 
   app.get("/api/universe/history", async (request) => {
     const query = z.object({ symbol: z.string().optional() }).parse(request.query);
     if (!query.symbol) {
-      return prisma.universeSnapshot.findMany({ orderBy: { snapshotDate: "desc" } });
+      return prisma.symbol.findMany({ where: { isActive: true }, orderBy: { ticker: "asc" } });
     }
 
-    const symbol = await prisma.symbol.findUnique({ where: { ticker: query.symbol } });
-    if (!symbol) return [];
-
-    return prisma.universeSnapshotItem.findMany({
-      where: { symbolId: symbol.id },
-      include: { snapshot: true },
-      orderBy: { snapshot: { snapshotDate: "desc" } },
+    return prisma.priceBar.findMany({
+      where: { symbol: { ticker: query.symbol } },
+      orderBy: { timestamp: "desc" },
+      take: 200,
     });
   });
 };

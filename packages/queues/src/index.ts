@@ -1,5 +1,6 @@
 import { getPlatformConfig } from "@stock-radar/config";
 import { createLogger } from "@stock-radar/logging";
+import { stableHash } from "@stock-radar/shared";
 import type { DiscordNotificationPayload } from "@stock-radar/types";
 import { Queue, Worker } from "bullmq";
 
@@ -16,6 +17,7 @@ export type QueueName = (typeof queueNames)[keyof typeof queueNames];
 
 export interface NewsQueuePayload {
   sweepType: "urgent" | "broad";
+  trigger?: "schedule" | "manual" | "startup";
 }
 
 export interface MarketQueuePayload {
@@ -43,6 +45,21 @@ export interface WorkerProcessor<T> {
 
 const getConnection = () => ({ connection: { url: getPlatformConfig().redisUrl } });
 
+export const sanitizeQueueJobId = (value: string) => {
+  const normalized = value
+    .trim()
+    .replace(/[:\s/\\]+/g, "-")
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+
+  if (normalized.length === 0) {
+    return `job-${stableHash(value).slice(0, 16)}`;
+  }
+
+  return normalized.slice(0, 180);
+};
+
 export const createPlatformQueue = (name: QueueName) =>
   new Queue(name, {
     ...getConnection(),
@@ -57,7 +74,11 @@ export const createPlatformQueue = (name: QueueName) =>
     },
   });
 
-export const createPlatformQueues = () => ({
+// Singleton queue instances — shared across the calling process to avoid connection proliferation.
+// Each process that calls createPlatformQueues() gets one set of Queue connections.
+let platformQueues: ReturnType<typeof buildPlatformQueues> | null = null;
+
+const buildPlatformQueues = () => ({
   news: createPlatformQueue(queueNames.news),
   market: createPlatformQueue(queueNames.market),
   validation: createPlatformQueue(queueNames.validation),
@@ -65,6 +86,13 @@ export const createPlatformQueues = () => ({
   supervisor: createPlatformQueue(queueNames.supervisor),
   notifications: createPlatformQueue(queueNames.notifications),
 });
+
+export const createPlatformQueues = () => {
+  if (!platformQueues) {
+    platformQueues = buildPlatformQueues();
+  }
+  return platformQueues;
+};
 
 export const createPlatformWorker = <T>(queueName: QueueName, serviceName: string, processor: WorkerProcessor<T>) => {
   const logger = createLogger(serviceName, { queueName });
@@ -115,21 +143,32 @@ const syncRepeatableJob = async <T extends object>(
 
   return queue.add(name, data, {
     repeat,
-    jobId,
+    jobId: sanitizeQueueJobId(jobId),
   });
 };
 
 export const ensureDefaultSchedules = async () => {
   const config = getPlatformConfig();
+  // Use the shared singleton queues — do not create a new set of queues here
+  // to avoid connection leaks. We are safe to use the singleton because
+  // ensureDefaultSchedules is called once at worker-supervisor bootstrap.
   const queues = createPlatformQueues();
   const logger = createLogger("scheduler");
 
-  await syncRepeatableJob(queues.news, "urgentSweep", { sweepType: "urgent" } satisfies NewsQueuePayload, {
-    every: config.schedules.newsUrgentMs,
-  }, "news-urgent-repeat");
-  await syncRepeatableJob(queues.news, "broadSweep", { sweepType: "broad" } satisfies NewsQueuePayload, {
-    every: config.schedules.newsBroadMs,
-  }, "news-broad-repeat");
+  await syncRepeatableJob(
+    queues.news,
+    "urgentSweep",
+    { sweepType: "urgent", trigger: "schedule" } satisfies NewsQueuePayload,
+    { every: config.schedules.newsUrgentMs },
+    "news-urgent-repeat",
+  );
+  await syncRepeatableJob(
+    queues.news,
+    "broadSweep",
+    { sweepType: "broad", trigger: "schedule" } satisfies NewsQueuePayload,
+    { every: config.schedules.newsBroadMs },
+    "news-broad-repeat",
+  );
   await syncRepeatableJob(queues.market, "scanWatchlist", {} satisfies MarketQueuePayload, {
     every: config.schedules.marketScanMs,
   }, "market-repeat");
@@ -165,9 +204,10 @@ export const ensureDefaultSchedules = async () => {
   logger.info("Default schedules ensured");
 };
 
+// queueNotification uses the shared singleton queues — no per-call connection creation.
 export const queueNotification = async (payload: DiscordNotificationPayload) => {
   const queues = createPlatformQueues();
   return queues.notifications.add("dispatchNotification", payload, {
-    jobId: payload.dedupeKey,
+    jobId: sanitizeQueueJobId(payload.dedupeKey),
   });
 };

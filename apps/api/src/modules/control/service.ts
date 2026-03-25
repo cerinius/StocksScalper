@@ -6,7 +6,7 @@ const queues = createPlatformQueues();
 
 export const triggerWorkerJob = async (worker: string, actorId?: string) => {
   const queueMap = {
-    news: () => queues.news.add("manualNewsSweep", { sweepType: "urgent" }),
+    news: () => queues.news.add("manualNewsSweep", { sweepType: "urgent", trigger: "manual" }),
     market: () => queues.market.add("manualMarketScan", {}),
     validation: () => queues.validation.add("manualValidation", { trigger: "manual" }),
     execution: () => queues.execution.add("manualExecutionLoop", { trigger: "manual" }),

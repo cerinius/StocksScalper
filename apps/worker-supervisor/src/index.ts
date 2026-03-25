@@ -3,13 +3,42 @@ import { summarizeAccountRisk, summarizeWorkerHealth } from "@stock-radar/core";
 import { Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
-import { createPlatformWorker, ensureDefaultSchedules, queueNames } from "@stock-radar/queues";
+import { createPlatformWorker, ensureDefaultSchedules, queueNames, queueNotification } from "@stock-radar/queues";
+import { stableHash } from "@stock-radar/shared";
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-supervisor");
 const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
 const asObject = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+const buildNotificationDedupeKey = (parts: Record<string, unknown>) =>
+  `notification-${stableHash(parts).slice(0, 24)}`;
+
+const enqueueSupervisorNotification = async (input: {
+  category: string;
+  severity: "info" | "warning" | "critical";
+  title: string;
+  body: string;
+  metadata: Record<string, unknown>;
+}) => {
+  const dedupeKey = buildNotificationDedupeKey({
+    category: input.category,
+    severity: input.severity,
+    title: input.title,
+    body: input.body,
+  });
+
+  await queueNotification({
+    category: input.category as "worker_health" | "trade_event" | "risk_event" | "daily_summary" | "integration" | "market_news" | "supervisor",
+    severity: input.severity,
+    title: input.title,
+    body: input.body,
+    dedupeKey,
+    metadata: input.metadata,
+  });
+
+  return dedupeKey;
+};
 
 const readDynamicControls = async () => {
   const setting = await prisma.systemSetting.findUnique({ where: { key: "risk.dynamicControls" } });
@@ -176,19 +205,14 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
       const latest = snapshots[0];
       const previous = snapshots[1] ?? latest;
 
-      await prisma.notification.create({
-        data: {
-          category: "daily_summary",
-          severity: "INFO",
-          channel: "DISCORD",
-          status: config.discordWebhookUrl ? "PENDING" : "SUPPRESSED",
-          dedupeKey: `daily-summary-${new Date().toISOString().slice(0, 10)}`,
-          title: "Daily trading summary",
-          body: latest
-            ? `Balance ${previous?.balance?.toFixed(2) ?? latest.balance.toFixed(2)} -> ${latest.balance.toFixed(2)}. Realized PnL ${latest.realizedPnlDaily.toFixed(2)}.`
-            : "No account snapshot available yet.",
-          payload: { latest, previous },
-        },
+      await enqueueSupervisorNotification({
+        category: "daily_summary",
+        severity: "info",
+        title: "Daily trading summary",
+        body: latest
+          ? `Balance ${previous?.balance?.toFixed(2) ?? latest.balance.toFixed(2)} -> ${latest.balance.toFixed(2)}. Realized PnL ${latest.realizedPnlDaily.toFixed(2)}.`
+          : "No account snapshot available yet.",
+        metadata: { latest, previous },
       });
     } else {
       const [heartbeats, account] = await Promise.all([
@@ -242,16 +266,12 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
         : [];
 
       for (const alert of [...workerAlerts, ...accountAlerts, ...throttleAlerts]) {
-        const notification = await prisma.notification.create({
-          data: {
-            category: alert.severity === "critical" ? "supervisor" : "worker_health",
-            severity: alert.severity.toUpperCase() as "INFO" | "WARNING" | "CRITICAL",
-            channel: "DISCORD",
-            status: config.discordWebhookUrl ? "PENDING" : "SUPPRESSED",
-            dedupeKey: `${alert.severity}-${alert.summary}`,
-            title: "Supervisor alert",
-            body: alert.summary,
-          },
+        const dedupeKey = await enqueueSupervisorNotification({
+          category: alert.severity === "critical" ? "supervisor" : "worker_health",
+          severity: alert.severity,
+          title: "Supervisor alert",
+          body: alert.summary,
+          metadata: { trigger, summary: alert.summary },
         });
 
         await prisma.supervisorEvent.create({
@@ -259,7 +279,7 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
             severity: alert.severity.toUpperCase() as "INFO" | "WARNING" | "CRITICAL",
             eventType: "health_check",
             summary: alert.summary,
-            notificationId: notification.id,
+            details: { dedupeKey },
           },
         });
       }
@@ -300,18 +320,38 @@ const processNotification = async (payload: {
   dedupeKey: string;
   metadata: Record<string, unknown>;
 }) => {
-  const notification = await prisma.notification.create({
-    data: {
-      category: payload.category,
-      severity: payload.severity.toUpperCase() as "INFO" | "WARNING" | "CRITICAL",
-      channel: "DISCORD",
-      status: config.discordWebhookUrl ? "PENDING" : "SUPPRESSED",
-      dedupeKey: payload.dedupeKey,
-      title: payload.title,
-      body: payload.body,
-      payload: asJson(payload.metadata),
-    },
-  });
+  // Guard against duplicate delivery using dedupeKey (@@unique in schema).
+  // We use findFirst + create/update instead of upsert to avoid relying on the
+  // compiled Prisma client type for the unique where clause before regeneration.
+  const existing = await prisma.notification.findFirst({ where: { dedupeKey: payload.dedupeKey } });
+
+  if (existing) {
+    // Already delivered or suppressed — skip re-sending.
+    if (existing.status === "SENT" || existing.status === "SUPPRESSED") {
+      logger.info("Notification already handled, skipping delivery", { dedupeKey: payload.dedupeKey, status: existing.status });
+      return;
+    }
+    // Bump retry count and fall through to re-attempt delivery.
+    await prisma.notification.update({
+      where: { id: existing.id },
+      data: { retryCount: { increment: 1 }, lastAttemptAt: new Date() },
+    });
+  }
+
+  const notification =
+    existing ??
+    (await prisma.notification.create({
+      data: {
+        category: payload.category,
+        severity: payload.severity.toUpperCase() as "INFO" | "WARNING" | "CRITICAL",
+        channel: "DISCORD",
+        status: config.discordWebhookUrl ? "PENDING" : "SUPPRESSED",
+        dedupeKey: payload.dedupeKey,
+        title: payload.title,
+        body: payload.body,
+        payload: asJson(payload.metadata),
+      },
+    }));
 
   if (!config.discordWebhookUrl) {
     await prisma.notification.update({

@@ -51,17 +51,22 @@ export const createWorkerRun = async (input: {
     },
   });
 
-export const completeWorkerRun = async (runId: string, resultSummary?: string, reasoning?: Record<string, unknown>) =>
-  prisma.workerRun.update({
+export const completeWorkerRun = async (runId: string, resultSummary?: string, reasoning?: Record<string, unknown>) => {
+  // Fetch startedAt to compute accurate durationMs
+  const run = await prisma.workerRun.findUnique({ where: { id: runId }, select: { startedAt: true } });
+  const durationMs = run ? Date.now() - run.startedAt.getTime() : undefined;
+
+  return prisma.workerRun.update({
     where: { id: runId },
     data: {
       status: "SUCCEEDED",
       finishedAt: new Date(),
-      durationMs: undefined,
+      durationMs,
       resultSummary,
       reasoning: reasoning ? asJson(reasoning) : undefined,
     },
   });
+};
 
 export const failWorkerRun = async (input: {
   runId?: string;
@@ -72,11 +77,15 @@ export const failWorkerRun = async (input: {
   payload?: Record<string, unknown>;
 }) => {
   if (input.runId) {
+    const run = await prisma.workerRun.findUnique({ where: { id: input.runId }, select: { startedAt: true } });
+    const durationMs = run ? Date.now() - run.startedAt.getTime() : undefined;
+
     await prisma.workerRun.update({
       where: { id: input.runId },
       data: {
         status: "FAILED",
         finishedAt: new Date(),
+        durationMs,
         resultSummary: input.message,
       },
     });

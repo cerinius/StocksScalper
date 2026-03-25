@@ -368,9 +368,9 @@ model Notification {
   template         NotificationTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
   supervisorEvents SupervisorEvent[]
 
+  @@unique([dedupeKey])
   @@index([category, severity])
   @@index([status, createdAt])
-  @@index([dedupeKey])
 }
 
 model NewsItem {

@@ -1,15 +1,10 @@
-import { setInterval } from "timers/promises";
-import { Prisma } from "@prisma/client";
+import { AssetClass, Prisma } from "@prisma/client";
 import { getPlatformConfig } from "@stock-radar/config";
-import {
-  completeWorkerRun,
-  createWorkerRun,
-  failWorkerRun,
-  prisma,
-  upsertWorkerHeartbeat,
-} from "@stock-radar/db";
+import { scoreNewsIntelligence } from "@stock-radar/core";
+import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
-import { queueNames } from "@stock-radar/queues";
+import { createPlatformQueues, createPlatformWorker, queueNames, queueNotification } from "@stock-radar/queues";
+import { stableHash } from "@stock-radar/shared";
 
 type PolygonNewsArticle = {
   id: string;
@@ -31,147 +26,236 @@ type PolygonNewsResponse = {
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-news");
-
-const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY;
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const POLLING_INTERVAL = Number(process.env.NEWS_URGENT_INTERVAL_MS ?? "60000");
-const NEWS_LIMIT = Number(process.env.NEWS_LIMIT ?? "25");
-const SEND_LATEST_ON_STARTUP = process.env.SEND_LATEST_ON_STARTUP === "true";
-
-const CURSOR_SETTING_KEY = "news.latestArticleId";
-
-let isRunning = false;
-
+const queues = createPlatformQueues();
 const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
 
-function ensurePositiveNumber(value: number, name: string) {
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`Invalid ${name}: ${value}`);
+// Use the centralized config for all news-specific settings
+const NEWS_LIMIT = config.news.limit;
+const SEND_LATEST_ON_STARTUP = config.news.sendLatestOnStartup;
+
+// Known fiat currency bases (3-letter ISO codes ending in USD = forex pair)
+const KNOWN_FIAT_BASES = new Set(["EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "JPY"]);
+// Known crypto bases whose USD pair should be classified as CRYPTO
+const KNOWN_CRYPTO_BASES = new Set([
+  "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "BCH",
+  "AVAX", "LINK", "DOT", "MATIC", "UNI", "ATOM", "TRX", "ETC",
+]);
+
+const assetClassFromSymbol = (symbol: string): AssetClass => {
+  if (symbol === "XAUUSD" || symbol === "XAGUSD") return AssetClass.COMMODITY;
+
+  if (symbol.endsWith("USD") && symbol.length <= 10) {
+    const base = symbol.slice(0, symbol.length - 3);
+    if (KNOWN_FIAT_BASES.has(base)) return AssetClass.FX;
+    if (KNOWN_CRYPTO_BASES.has(base)) return AssetClass.CRYPTO;
+    // Longer unknown USD pairs (e.g. SOLUSD at 6 chars) are most likely crypto
+    return symbol.length > 6 ? AssetClass.CRYPTO : AssetClass.FX;
   }
-}
+
+  if (["SPY", "QQQ"].includes(symbol)) return AssetClass.ETF;
+  return AssetClass.EQUITY;
+};
+
+const normalizeTicker = (ticker: string) => ticker.toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 15000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function getLatestArticleId(): Promise<string | null> {
-  const row = await prisma.systemSetting.findUnique({
-    where: { key: CURSOR_SETTING_KEY },
+const readCursor = async (sweepType: "urgent" | "broad") => {
+  const setting = await prisma.systemSetting.findUnique({
+    where: { key: `news.cursor.${sweepType}` },
   });
+  return typeof setting?.value === "string" ? setting.value : null;
+};
 
-  if (!row) return null;
-  return typeof row.value === "string" ? row.value : null;
-}
-
-async function setLatestArticleId(articleId: string): Promise<void> {
+const writeCursor = async (sweepType: "urgent" | "broad", articleId: string) => {
   await prisma.systemSetting.upsert({
-    where: { key: CURSOR_SETTING_KEY },
+    where: { key: `news.cursor.${sweepType}` },
     update: {
       value: articleId,
       valueType: "string",
-      description: "Latest Polygon news article id processed by worker-news",
+      description: `Latest Polygon news article id processed by ${sweepType} sweep`,
     },
     create: {
-      key: CURSOR_SETTING_KEY,
+      key: `news.cursor.${sweepType}`,
       value: articleId,
       valueType: "string",
-      description: "Latest Polygon news article id processed by worker-news",
+      description: `Latest Polygon news article id processed by ${sweepType} sweep`,
     },
   });
-}
+};
 
-async function sendToDiscord(article: PolygonNewsArticle): Promise<boolean> {
-  if (!DISCORD_WEBHOOK_URL) {
-    logger.warn("DISCORD_WEBHOOK_URL is not configured; suppressing news alert");
-    return true;
+const fetchPolygonNews = async (sweepType: "urgent" | "broad") => {
+  const apiKey = config.marketData.massive.apiKey;
+  if (!apiKey) {
+    throw new Error("MASSIVE_API_KEY is not configured — required for Polygon news ingestion");
   }
 
-  const payload = {
-    embeds: [
-      {
-        title: article.title,
-        url: article.article_url,
-        description: article.description?.slice(0, 4000),
-        author: { name: article.publisher?.name || "Polygon News" },
-        ...(article.image_url ? { image: { url: article.image_url } } : {}),
-        timestamp: new Date(article.published_utc).toISOString(),
-        footer: {
-          text: `Tickers: ${article.tickers?.join(", ") || "N/A"}`,
-        },
-        color: 0x00a3e0,
-      },
-    ],
-  };
-
-  try {
-    const res = await fetchWithTimeout(
-      DISCORD_WEBHOOK_URL,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-      10000,
-    );
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      logger.error("Discord webhook rejected payload", {
-        status: res.status,
-        body,
-        articleId: article.id,
-      });
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    logger.error("Failed to send article to Discord", {
-      articleId: article.id,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return false;
-  }
-}
-
-async function fetchPolygonNews(): Promise<PolygonNewsArticle[]> {
-  if (!MASSIVE_API_KEY) {
-    throw new Error("MASSIVE_API_KEY is not defined");
-  }
-
+  const limit = sweepType === "urgent" ? Math.max(NEWS_LIMIT, 25) : Math.max(NEWS_LIMIT, 100);
   const url =
     `https://api.polygon.io/v2/reference/news` +
-    `?limit=${NEWS_LIMIT}` +
+    `?limit=${limit}` +
     `&sort=published_utc` +
     `&order=desc` +
-    `&apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+    `&apiKey=${encodeURIComponent(apiKey)}`;
 
   const res = await fetchWithTimeout(url, {}, 15000);
 
   if (!res.ok) {
-    throw new Error(`Polygon API error: ${res.status} ${res.statusText}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(`Polygon API error: ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
   }
 
   const data = (await res.json()) as PolygonNewsResponse;
   return data.results ?? [];
-}
+};
 
-async function pollNews(trigger: "startup" | "interval") {
+const upsertSymbol = async (ticker: string) => {
+  const assetClass = assetClassFromSymbol(ticker);
+
+  return prisma.symbol.upsert({
+    where: { ticker },
+    update: { isActive: true, assetClass },
+    create: {
+      ticker,
+      name: ticker,
+      assetClass,
+      exchange: assetClass === AssetClass.FX || assetClass === AssetClass.CRYPTO ? "OTC" : "NASDAQ",
+      sector: assetClass.toString(),
+      isActive: true,
+    },
+  });
+};
+
+const maybeQueueUrgentNotification = async (
+  article: PolygonNewsArticle,
+  urgency: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+) => {
+  if (urgency !== "HIGH" && urgency !== "CRITICAL") return;
+
+  await queueNotification({
+    category: "market_news",
+    severity: urgency === "CRITICAL" ? "critical" : "warning",
+    title: article.title,
+    body: article.description || article.title,
+    dedupeKey: `market-news-${stableHash({ id: article.id, urgency }).slice(0, 24)}`,
+    metadata: {
+      articleId: article.id,
+      articleUrl: article.article_url ?? null,
+      imageUrl: article.image_url ?? null,
+      publishedUtc: article.published_utc,
+      tickers: article.tickers ?? [],
+      urgency,
+    },
+  });
+};
+
+const persistArticle = async (article: PolygonNewsArticle) => {
+  const symbols = [...new Set((article.tickers ?? []).map(normalizeTicker).filter(Boolean))];
+  const affectedAssetClasses = [...new Set(symbols.map((symbol) => assetClassFromSymbol(symbol).toString()))];
+
+  const scored = scoreNewsIntelligence({
+    source: article.publisher?.name || "Polygon News",
+    headline: article.title,
+    summary: article.description || article.title,
+    originalTimestamp: article.published_utc,
+    affectedSymbols: symbols,
+    affectedAssetClasses,
+    tags: [...new Set([...(article.keywords ?? []), "polygon"])],
+    category: symbols.length > 0 ? "symbol" : "macro",
+    rawPayloadRef: article.article_url || `polygon-${article.id}`,
+  });
+
+  const newsItem = await prisma.newsItem.upsert({
+    where: { dedupeHash: scored.dedupeHash },
+    update: {
+      source: scored.source,
+      headline: scored.headline,
+      summary: scored.summary,
+      originalTimestamp: new Date(scored.originalTimestamp),
+      directionalBias: scored.directionalBias,
+      urgency: scored.urgency,
+      relevanceScore: scored.relevanceScore,
+      volatilityImpact: scored.volatilityImpact,
+      confidence: scored.confidence,
+      tags: asJson(scored.tags),
+      category: scored.category,
+      affectedAssetClass: asJson(scored.affectedAssetClasses),
+      rawPayloadRef: scored.rawPayloadRef,
+      reasoningLog: asJson(scored.reasoningLog),
+      status: scored.status,
+      metadata: asJson({
+        polygonId: article.id,
+        imageUrl: article.image_url ?? null,
+        articleUrl: article.article_url ?? null,
+        keywords: article.keywords ?? [],
+      }),
+    },
+    create: {
+      source: scored.source,
+      headline: scored.headline,
+      summary: scored.summary,
+      originalTimestamp: new Date(scored.originalTimestamp),
+      directionalBias: scored.directionalBias,
+      urgency: scored.urgency,
+      relevanceScore: scored.relevanceScore,
+      volatilityImpact: scored.volatilityImpact,
+      confidence: scored.confidence,
+      tags: asJson(scored.tags),
+      category: scored.category,
+      affectedAssetClass: asJson(scored.affectedAssetClasses),
+      rawPayloadRef: scored.rawPayloadRef,
+      reasoningLog: asJson(scored.reasoningLog),
+      dedupeHash: scored.dedupeHash,
+      status: scored.status,
+      metadata: asJson({
+        polygonId: article.id,
+        imageUrl: article.image_url ?? null,
+        articleUrl: article.article_url ?? null,
+        keywords: article.keywords ?? [],
+      }),
+    },
+  });
+
+  for (const ticker of symbols) {
+    const symbol = await upsertSymbol(ticker);
+    await prisma.symbolNewsLink.upsert({
+      where: {
+        newsItemId_symbolId: {
+          newsItemId: newsItem.id,
+          symbolId: symbol.id,
+        },
+      },
+      update: {
+        relevanceScore: scored.relevanceScore,
+        reasoning: `Linked from Polygon tickers for ${ticker}`,
+      },
+      create: {
+        newsItemId: newsItem.id,
+        symbolId: symbol.id,
+        relevanceScore: scored.relevanceScore,
+        reasoning: `Linked from Polygon tickers for ${ticker}`,
+      },
+    });
+  }
+
+  return { newsItem, scored, symbols };
+};
+
+const processNewsSweep = async (payload: { sweepType: "urgent" | "broad"; trigger?: "schedule" | "manual" | "startup" }) => {
   const run = await createWorkerRun({
     workerType: "NEWS",
     queueName: queueNames.news,
-    jobName: trigger === "startup" ? "startupPoll" : "intervalPoll",
-    payload: { trigger },
+    jobName: payload.sweepType === "urgent" ? "urgentSweep" : "broadSweep",
+    payload,
   });
 
   try {
@@ -179,47 +263,40 @@ async function pollNews(trigger: "startup" | "interval") {
       workerType: "NEWS",
       serviceName: "worker-news",
       status: "running",
-      currentTask: trigger === "startup" ? "startup-poll" : "polling-polygon",
+      currentTask: `${payload.sweepType}-sweep`,
     });
 
-    const results = await fetchPolygonNews();
-    logger.info("Fetched Polygon news", {
-      count: results.length,
-      trigger,
-    });
+    const results = await fetchPolygonNews(payload.sweepType);
+    const latestStoredCursor = await readCursor(payload.sweepType);
 
     if (results.length === 0) {
-      await completeWorkerRun(run.id, "No news returned", { fetched: 0, newArticles: 0 });
+      await completeWorkerRun(run.id, "No Polygon news returned", { fetched: 0, inserted: 0, linked: 0 });
       await upsertWorkerHeartbeat({
         workerType: "NEWS",
         serviceName: "worker-news",
         status: "healthy",
         currentTask: "idle",
-        metrics: { fetched: 0, newArticles: 0 },
+        metrics: { fetched: 0, inserted: 0, linked: 0 },
       });
       return;
     }
 
-    let latestArticleId = await getLatestArticleId();
+    if (!latestStoredCursor) {
+      await writeCursor(payload.sweepType, results[0].id);
 
-    if (!latestArticleId) {
-      latestArticleId = results[0].id;
-      await setLatestArticleId(latestArticleId);
-
-      logger.info("Initialized latest Polygon article cursor", {
-        latestArticleId,
-      });
-
-      if (SEND_LATEST_ON_STARTUP && results[0]) {
-        logger.info("SEND_LATEST_ON_STARTUP enabled; sending latest article");
-        await sendToDiscord(results[0]);
+      if (payload.trigger === "startup" && SEND_LATEST_ON_STARTUP && results[0]) {
+        const persisted = await persistArticle(results[0]);
+        await maybeQueueUrgentNotification(
+          results[0],
+          persisted.scored.urgency as "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+        );
       }
 
-      await completeWorkerRun(run.id, "Initialized cursor", {
+      await completeWorkerRun(run.id, "Initialized Polygon news cursor", {
         fetched: results.length,
-        initializedTo: latestArticleId,
+        initializedTo: results[0].id,
+        trigger: payload.trigger ?? "schedule",
       });
-
       await upsertWorkerHeartbeat({
         workerType: "NEWS",
         serviceName: "worker-news",
@@ -227,108 +304,80 @@ async function pollNews(trigger: "startup" | "interval") {
         currentTask: "idle",
         metrics: { fetched: results.length, initialized: true },
       });
-
       return;
     }
 
     const unseen: PolygonNewsArticle[] = [];
     for (const article of results) {
-      if (article.id === latestArticleId) break;
+      if (article.id === latestStoredCursor) break;
       unseen.push(article);
     }
 
-    logger.info("Computed unseen Polygon articles", {
-      previousLatestArticleId: latestArticleId,
-      unseenCount: unseen.length,
-    });
-
-    let sentCount = 0;
-    let newestProcessedId: string | null = latestArticleId;
+    let inserted = 0;
+    let linked = 0;
+    let notifications = 0;
+    let newestProcessedId = latestStoredCursor;
 
     for (const article of unseen.reverse()) {
-      logger.info("Dispatching Polygon article", {
-        articleId: article.id,
-        title: article.title,
-      });
-
-      const ok = await sendToDiscord(article);
-      if (!ok) {
-        break;
-      }
-
+      const persisted = await persistArticle(article);
+      inserted += 1;
+      linked += persisted.symbols.length;
       newestProcessedId = article.id;
-      sentCount += 1;
+
+      if (persisted.scored.urgency === "HIGH" || persisted.scored.urgency === "CRITICAL") {
+        await maybeQueueUrgentNotification(
+          article,
+          persisted.scored.urgency as "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+        );
+        notifications += 1;
+      }
     }
 
-    if (newestProcessedId && newestProcessedId !== latestArticleId) {
-      await setLatestArticleId(newestProcessedId);
+    if (newestProcessedId !== latestStoredCursor) {
+      await writeCursor(payload.sweepType, newestProcessedId);
     }
 
-    await completeWorkerRun(run.id, `${sentCount} news alerts sent`, {
+    await completeWorkerRun(run.id, `${inserted} Polygon articles processed`, {
       fetched: results.length,
       unseenCount: unseen.length,
-      sentCount,
+      inserted,
+      linked,
+      notifications,
       latestArticleId: newestProcessedId,
     });
-
     await upsertWorkerHeartbeat({
       workerType: "NEWS",
       serviceName: "worker-news",
       status: "healthy",
       currentTask: "idle",
-      metrics: {
-        fetched: results.length,
-        unseenCount: unseen.length,
-        sentCount,
-      },
+      metrics: { fetched: results.length, unseenCount: unseen.length, inserted, linked, notifications },
     });
   } catch (error) {
     const err = error as Error;
-
     await failWorkerRun({
       runId: run.id,
       workerType: "NEWS",
       message: err.message,
       stack: err.stack,
-      payload: { trigger },
+      payload,
     });
-
     await upsertWorkerHeartbeat({
       workerType: "NEWS",
       serviceName: "worker-news",
       status: "degraded",
       currentTask: "error",
-      metrics: { error: err.message },
+      metrics: { error: err.message, sweepType: payload.sweepType },
     });
-
-    logger.error("News poll failed", {
-      trigger,
-      error: err.message,
-    });
+    throw error;
   }
-}
+};
 
-async function runPoll(trigger: "startup" | "interval") {
-  if (isRunning) {
-    logger.warn("Skipping overlapping news poll", { trigger });
-    return;
-  }
-
-  isRunning = true;
-  try {
-    await pollNews(trigger);
-  } finally {
-    isRunning = false;
-  }
-}
-
-async function start() {
-  ensurePositiveNumber(POLLING_INTERVAL, "NEWS_URGENT_INTERVAL_MS");
-  ensurePositiveNumber(NEWS_LIMIT, "NEWS_LIMIT");
-
-  logger.info("Starting Polygon.io news worker", {
-    pollingIntervalMs: POLLING_INTERVAL,
+async function bootstrap() {
+  logger.info("worker-news starting", {
     newsLimit: NEWS_LIMIT,
+    startupDispatch: SEND_LATEST_ON_STARTUP,
+    provider: config.dataProvider,
+    apiKeyConfigured: Boolean(config.marketData.massive.apiKey),
   });
 
   process.on("SIGTERM", () => {
@@ -341,14 +390,32 @@ async function start() {
     process.exit(0);
   });
 
-  await runPoll("startup");
+  createPlatformWorker<{ sweepType: "urgent" | "broad"; trigger?: "schedule" | "manual" | "startup" }>(
+    queueNames.news,
+    "worker-news",
+    async (payload) => {
+      await processNewsSweep(payload);
+    },
+  );
 
-  for await (const _ of setInterval(POLLING_INTERVAL)) {
-    await runPoll("interval");
-  }
+  await queues.news.add(
+    "startupNewsSweep",
+    { sweepType: "urgent", trigger: "startup" },
+    { jobId: `news-startup-${Date.now()}` },
+  );
+
+  await upsertWorkerHeartbeat({
+    workerType: "NEWS",
+    serviceName: "worker-news",
+    status: "healthy",
+    currentTask: "idle",
+    metrics: { mode: config.dataProvider, newsLimit: NEWS_LIMIT },
+  });
+
+  logger.info("worker-news ready");
 }
 
-start().catch((error) => {
+bootstrap().catch((error) => {
   logger.error("worker-news failed to start", {
     error: error instanceof Error ? error.message : String(error),
   });
