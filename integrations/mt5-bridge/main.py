@@ -62,6 +62,7 @@ def get_account():
             equity=acc.equity,
             margin=acc.margin,
             margin_free=acc.margin_free,
+            profit=acc.profit,
             currency=acc.currency,
             leverage=acc.leverage,
         )
@@ -164,19 +165,41 @@ def disconnect():
 def get_quote(symbol: str):
     try:
         MT5Client.ensure_connected()
+
+        # Ensure symbol is in Market Watch before querying tick
+        # (MT5 only returns tick data for symbols visible in Market Watch)
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Symbol '{symbol}' not found in MT5. Check the symbol name matches your broker's format (e.g. XAUUSD, EURUSD).",
+            )
+
+        if not symbol_info.visible:
+            if not mt5.symbol_select(symbol, True):
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Could not add '{symbol}' to Market Watch: {mt5.last_error()}",
+                )
+
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise HTTPException(
-                status_code=404,
-                detail=f"Tick data not found for {symbol}",
+                status_code=503,
+                detail=f"No tick data available for '{symbol}'. MT5 error: {mt5.last_error()}",
             )
+
+        mid = (tick.bid + tick.ask) / 2 if (tick.bid and tick.ask) else tick.last or 0
+        spread_pct = ((tick.ask - tick.bid) / mid * 100) if mid > 0 else 0
 
         return {
             "symbol": symbol,
             "bid": tick.bid,
             "ask": tick.ask,
             "last": tick.last,
-            "spread": (tick.ask - tick.bid) / tick.bid * 100 if tick.bid > 0 else 0,
+            "mid": round(mid, 6),
+            "spread": round(spread_pct, 4),
+            "spreadPct": round(spread_pct, 4),
             "connected": True,
         }
     except HTTPException:

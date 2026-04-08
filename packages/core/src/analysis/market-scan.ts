@@ -15,6 +15,16 @@ import type { NewsIntelligenceRecord, PriceBar, Timeframe, TradeCandidateRecord,
 import { buildReasoningLog, clamp, percentChange } from "@stock-radar/shared";
 import { calculateIndicatorSnapshot } from "./indicators";
 import { detectMarketRegime } from "./regime";
+import { checkSessionQuality, computeDynamicTakeProfit, type AssetClass } from "./intelligence";
+
+/** Map a symbol ticker to its broad asset class for session filtering */
+const resolveAssetClass = (symbol: string): AssetClass => {
+  if (/^[A-Z]{3,5}USD$/.test(symbol) && !["EURUSD","GBPUSD","AUDUSD","NZDUSD","USDCAD","USDCHF","USDJPY"].includes(symbol)) return "CRYPTO";
+  if (/^[A-Z]{6}$/.test(symbol)) return "FX";
+  if (["XAUUSD","XAGUSD","WTIUSD","BRENTUSD","NATGAS"].includes(symbol)) return "COMMODITY";
+  if (["SPY","QQQ","IWM","DIA","VXX"].includes(symbol)) return "ETF";
+  return "EQUITY";
+};
 
 // ─── Direction inference ──────────────────────────────────────────────────────
 
@@ -276,6 +286,17 @@ export const analyzeMarketCandidate = (
   const oldest = bars.at(-20);
   if (!latest || !oldest) return null;
 
+  // ── Session quality gate ───────────────────────────────────────────────────
+  // Skip low-liquidity windows where spreads blow out and signals are noisy.
+  // Crypto is exempt (24/7). On the 1d timeframe, session timing doesn't apply.
+  if (timeframe !== "1d") {
+    const assetClass = resolveAssetClass(symbol);
+    const session = checkSessionQuality(assetClass);
+    if (!session.allowed) {
+      return null; // silent reject — logged at worker level if needed
+    }
+  }
+
   const ind = calculateIndicatorSnapshot(bars);
   const regime = detectMarketRegime(bars, ind);
   const priceMomentumPct = percentChange(oldest.close, latest.close);
@@ -295,7 +316,7 @@ export const analyzeMarketCandidate = (
   const strategyType = selectStrategy(direction, ind, regime);
   const currentPrice = latest.close;
 
-  const { stopLoss, takeProfit, stopDistance } = computeLevels(
+  const { stopLoss, stopDistance } = computeLevels(
     direction,
     currentPrice,
     ind.atr14,
@@ -303,7 +324,21 @@ export const analyzeMarketCandidate = (
     ind,
   );
 
-  const riskReward = Math.abs((takeProfit - currentPrice) / Math.max(stopDistance, 0.0001));
+  // ── Dynamic take profit (volatility-adjusted) ──────────────────────────────
+  const volClass = (regime.regime === "bull_trend" || regime.regime === "bear_trend") ? "high"
+    : regime.regime === "breakout_expansion" ? "high"
+    : regime.regime === "range_mean_reversion" ? "low"
+    : regime.regime === "volatile_reversal" ? "extreme"
+    : "medium";
+  const dynamicTP = computeDynamicTakeProfit(
+    currentPrice,
+    stopLoss,
+    direction,
+    ind.atr14,
+    volClass,
+  );
+  const takeProfit = dynamicTP.takeProfit;
+  const riskReward = dynamicTP.riskReward;
 
   // Confidence considers agreement + regime alignment + MACD histogram
   const macdBoost = ind.macdHistogram !== undefined ? clamp(Math.abs(ind.macdHistogram) * 0.5, 0, 5) : 0;

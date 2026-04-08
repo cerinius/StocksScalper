@@ -13,31 +13,35 @@ const useLiveBridge = mt5BridgeUrl.length > 0;
 
 console.log('MT5_BRIDGE_URL:', process.env.MT5_BRIDGE_URL, 'mt5BridgeUrl:', mt5BridgeUrl, 'useLiveBridge:', useLiveBridge);
 
-const proxyToBridge = async (path: string, method: string = "GET", body?: unknown) => {
+const proxyToBridge = async (path: string, method: string = "GET", body?: unknown): Promise<{ status: number; data: unknown; bridgeError?: string }> => {
   if (!useLiveBridge) {
-    throw new Error("MT5_BRIDGE_URL is not configured");
+    return { status: 503, data: { error: "MT5_BRIDGE_URL is not configured. Set it to your Python bridge URL." }, bridgeError: "not_configured" };
   }
 
   const url = `${mt5BridgeUrl}${path}`;
-  const response = await fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(8000), // 8s timeout
+    });
 
-  const text = await response.text();
-  let data: unknown = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = text;
+    const text = await response.text();
+    let data: unknown = null;
+    if (text) {
+      try { data = JSON.parse(text); } catch { data = text; }
     }
+    return { status: response.status, data };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn("MT5 bridge unreachable", { path, error: msg });
+    return {
+      status: 503,
+      data: { error: `MT5 bridge unreachable: ${msg}. Ensure integrations/mt5-bridge/run.ps1 is running on your Windows machine.` },
+      bridgeError: msg,
+    };
   }
-
-  return { status: response.status, data };
 };
 
 const state = {
@@ -77,15 +81,25 @@ const getSpreadPct = (symbol: string) => {
   return Number((base * connectionPenalty).toFixed(4));
 };
 
-app.get("/health", async (request, reply) => {
+app.get("/health", async (_request, reply) => {
   if (useLiveBridge) {
     const result = await proxyToBridge("/health");
-    return reply.status(result.status).send(result.data);
+    // Always return 200 from the adapter itself — bridge connectivity is a warning, not a fatal
+    const bridgeOk = result.status === 200 && !result.bridgeError;
+    return reply.status(200).send({
+      ok: true,
+      bridgeConnected: bridgeOk,
+      bridgeUrl: mt5BridgeUrl,
+      bridgeError: result.bridgeError ?? null,
+      mode: config.trading.mode,
+    });
   }
 
   return {
     ok: true,
-    connected: state.connected,
+    bridgeConnected: false,
+    bridgeUrl: null,
+    bridgeError: "MT5_BRIDGE_URL not set — running in paper mock mode",
     mode: state.mode,
     lastSyncAt: state.lastSyncAt,
   };
@@ -117,19 +131,47 @@ app.post("/disconnect", async (request, reply) => {
   return { connected: false, lastSyncAt: state.lastSyncAt };
 });
 
-app.get("/account", async (request, reply) => {
+app.get("/account", async (_request, reply) => {
   if (useLiveBridge) {
     const result = await proxyToBridge("/account");
-    if (result.status !== 200) {
-      return reply.status(result.status).send(result.data);
+    if (result.status !== 200 || result.bridgeError) {
+      // Bridge is down — return 503 so the dashboard shows disconnected
+      return reply.status(503).send({ error: result.data });
     }
-    const data = result.data;
+    // Python bridge AccountResponse schema fields: balance, equity, margin, margin_free, profit, currency, leverage
+    const d = result.data as {
+      balance: number;
+      equity: number;
+      margin_free?: number;
+      margin?: number;
+      profit: number;
+    };
+    const balance = d.balance ?? 0;
+    const equity = d.equity ?? balance;
+    const openPnl = d.profit ?? (equity - balance);
+    const usedMargin = d.margin ?? 0;
+    const freeMargin = d.margin_free ?? (equity - usedMargin);
+    const drawdownPct = balance > 0 ? Math.max(0, ((balance - equity) / balance) * 100) : 0;
+    // Compute risk state based on daily loss and drawdown
+    const dailyLossLimit = config.risk.maxDailyLossPct;
+    const riskState =
+      config.trading.killSwitch ? "KILL_SWITCH"
+      : drawdownPct >= dailyLossLimit * 0.9 ? "BLOCKED"
+      : drawdownPct >= dailyLossLimit * 0.6 ? "CAUTION"
+      : "NORMAL";
+
     return {
-      balance: data.balance,
-      equity: data.equity,
-      freeMargin: data.equity, // approximate
-      usedMargin: 0,
-      lastSyncAt: new Date().toISOString()
+      balance,
+      equity,
+      freeMargin,
+      usedMargin,
+      openPnl,
+      realizedPnlDaily: 0, // MT5 bridge doesn't expose this directly; supervisor tracks it
+      drawdownPct: Number(drawdownPct.toFixed(3)),
+      maxDrawdownPct: dailyLossLimit,
+      riskState,
+      killSwitchActive: config.trading.killSwitch,
+      mode: config.trading.mode,
     };
   }
   return state.account;

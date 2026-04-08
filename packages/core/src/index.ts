@@ -8,6 +8,7 @@ export * from "./news/intelligence";
 export * from "./analysis/indicators";
 export * from "./analysis/market-scan";
 export * from "./analysis/regime";
+export * from "./analysis/intelligence";
 export * from "./validation/score";
 export * from "./analytics/monte-carlo";
 export * from "./execution/decision-engine";

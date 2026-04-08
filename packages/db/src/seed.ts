@@ -39,16 +39,26 @@ async function main() {
   });
 
   // ── Integrations ─────────────────────────────────────────────────────────────────────────
+  // Respect the TRADING_MODE env var so the dashboard shows the correct mode.
+  const tradingMode = (process.env.TRADING_MODE ?? "paper").toUpperCase() as "PAPER" | "LIVE";
+  const mt5Label = tradingMode === "LIVE"
+    ? "MT5 Live Broker (OxSecurities)"
+    : "MT5 Demo Broker (OxSecurities-Demo)";
+
   const mt5Integration = await prisma.integration.upsert({
     where: { id: "seed-mt5" },
-    update: {},
+    update: {
+      name: mt5Label,
+      mode: tradingMode,
+      configJson: asJson({ host: "http://mt5-adapter:4310", paper: tradingMode === "PAPER" }),
+    },
     create: {
       id: "seed-mt5",
       kind: "MT5",
-      name: "MT5 Paper Broker (Local Adapter)",
-      mode: "PAPER",
+      name: mt5Label,
+      mode: tradingMode,
       enabled: true,
-      configJson: asJson({ host: "http://mt5-adapter:4310", paper: true }),
+      configJson: asJson({ host: "http://mt5-adapter:4310", paper: tradingMode === "PAPER" }),
     },
   });
 
@@ -56,7 +66,9 @@ async function main() {
     data: {
       integrationId: mt5Integration.id,
       status: "CONNECTED",
-      summary: "Paper trading adapter running locally.",
+      summary: tradingMode === "LIVE"
+        ? "Live MT5 adapter connected to OxSecurities."
+        : "Demo MT5 adapter connected to OxSecurities-Demo.",
       lastHeartbeatAt: new Date(),
     },
   });

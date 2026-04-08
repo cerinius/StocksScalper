@@ -1,5 +1,6 @@
 import { getPlatformConfig } from "@stock-radar/config";
-import { summarizeAccountRisk, summarizeWorkerHealth } from "@stock-radar/core";
+import { summarizeAccountRisk, summarizeWorkerHealth, computeAtrTrailingStop } from "@stock-radar/core";
+import type { PriceBar } from "@stock-radar/types";
 import { Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
@@ -181,6 +182,114 @@ const maybeThrottleRisk = async (
   };
 };
 
+/** Fetch recent price bars for a symbol+timeframe from the DB */
+const getRecentBars = async (symbolId: string, timeframe: string, take = 30): Promise<PriceBar[]> => {
+  const rows = await prisma.priceBar.findMany({
+    where: { symbolId, timeframe },
+    orderBy: { timestamp: "asc" },
+    take,
+    select: { open: true, high: true, low: true, close: true, volume: true, timestamp: true },
+  });
+  return rows.map((r) => ({
+    symbol: symbolId,
+    timeframe: timeframe as PriceBar["timeframe"],
+    timestamp: r.timestamp.toISOString(),
+    open: r.open,
+    high: r.high,
+    low: r.low,
+    close: r.close,
+    volume: r.volume,
+  }));
+};
+
+/**
+ * ATR Trailing Stop Manager
+ * Runs each supervisor cycle. For every open position it:
+ *   1. Fetches recent price bars from the DB
+ *   2. Computes the ATR-based trailing stop
+ *   3. If the stop has moved in the position's favour, updates it in the DB
+ *      and sends a modify order to the MT5 adapter
+ */
+const manageTrailingStops = async () => {
+  const openPositions = await prisma.position.findMany({
+    where: { status: "OPEN" },
+    include: { symbol: true },
+  });
+
+  if (openPositions.length === 0) return;
+
+  const mt5AdapterUrl = config.services.mt5AdapterUrl;
+
+  for (const pos of openPositions) {
+    try {
+      const bars = await getRecentBars(pos.symbolId, pos.stopLoss ? "15m" : "1h", 30);
+      if (bars.length < 15) continue;
+
+      const direction = pos.direction as "LONG" | "SHORT";
+      const trailResult = computeAtrTrailingStop(
+        bars,
+        direction,
+        pos.stopLoss,
+        pos.avgEntryPrice,
+        2.0, // 2× ATR trail
+      );
+
+      if (!trailResult.moved) continue;
+
+      // Only accept the new stop if it genuinely improves the position
+      const improved =
+        direction === "LONG"
+          ? trailResult.newStopLoss > pos.stopLoss  // trail up
+          : trailResult.newStopLoss < pos.stopLoss; // trail down
+
+      if (!improved) continue;
+
+      // Update in DB
+      await prisma.position.update({
+        where: { id: pos.id },
+        data: { stopLoss: trailResult.newStopLoss },
+      });
+
+      // Send modify to MT5 adapter if connected
+      try {
+        await fetch(`${mt5AdapterUrl}/positions/${pos.id}/modify`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ stopLoss: trailResult.newStopLoss }),
+          signal: AbortSignal.timeout(5000),
+        });
+      } catch {
+        // Non-fatal: DB is the source of truth; adapter will resync
+      }
+
+      logger.info("ATR trailing stop moved", {
+        symbol: pos.symbol.ticker,
+        direction,
+        oldStop: pos.stopLoss.toFixed(5),
+        newStop: trailResult.newStopLoss.toFixed(5),
+        atr: trailResult.atr.toFixed(5),
+        distanceAtr: trailResult.distanceAtr,
+      });
+
+      await prisma.auditLog.create({
+        data: {
+          actorType: "WORKER",
+          actorId: "worker-supervisor",
+          workerType: "SUPERVISOR",
+          severity: "INFO",
+          category: "trailing_stop",
+          message: `Trailing stop moved for ${pos.symbol.ticker}: ${pos.stopLoss.toFixed(5)} → ${trailResult.newStopLoss.toFixed(5)} (ATR ${trailResult.atr.toFixed(5)})`,
+          entityType: "position",
+          entityId: pos.id,
+          symbolId: pos.symbolId,
+        },
+      });
+    } catch (err) {
+      logger.warn("Failed to compute trailing stop", { positionId: pos.id, error: (err as Error).message });
+    }
+  }
+};
+
 const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | "manual") => {
   const run = await createWorkerRun({
     workerType: "SUPERVISOR",
@@ -219,6 +328,10 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
         prisma.workerHeartbeat.findMany({ orderBy: { workerType: "asc" } }),
         prisma.accountSnapshot.findFirst({ orderBy: { capturedAt: "desc" } }),
       ]);
+
+      // Manage ATR trailing stops on all open positions
+      await manageTrailingStops();
+
       const throttleEvent = await maybeThrottleRisk(
         account
           ? {

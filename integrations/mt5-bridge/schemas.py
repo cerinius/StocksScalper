@@ -18,6 +18,7 @@ class AccountResponse(BaseModel):
     equity: float
     margin: float
     margin_free: float
+    profit: float
     currency: str
     leverage: int
 

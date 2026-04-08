@@ -1,185 +1,118 @@
-# ============================================================
-# StocksScalper — Full Startup Script
-# Account: Ekjot Singh | OxSecurities-Demo | $100,000 USD
-# ============================================================
-#
-# BEFORE RUNNING THIS SCRIPT:
-#   1. Make sure MetaTrader 5 is running (it's already open — good!)
-#   2. Make sure Docker Desktop is running
-#   3. Right-click this file → "Run with PowerShell"
-#      (or open PowerShell and run: .\START.ps1)
-#
-# WHAT THIS DOES:
-#   Step 1: Starts the MT5 Python Bridge (connects Docker to your MT5 terminal)
-#   Step 2: Waits for the bridge to be healthy
-#   Step 3: Starts all Docker services (database, workers, web dashboard)
-# ============================================================
+# StocksScalper Startup Script
+# Right-click -> Run with PowerShell
+# Or open PowerShell and run: .\START.ps1
 
-param(
-    [switch]$BridgeOnly,
-    [switch]$DockerOnly
-)
+$ErrorActionPreference = "Continue"
+Set-Location $PSScriptRoot
 
-$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BridgePath = Join-Path $ScriptRoot "integrations\mt5-bridge"
+Write-Host ""
+Write-Host "=== StocksScalper Startup ===" -ForegroundColor Cyan
+Write-Host "Account: Ekjot Singh | OxSecurities-Demo | 100k USD"
+Write-Host ""
 
-function Write-Step {
-    param($msg)
-    Write-Host "`n>>> $msg" -ForegroundColor Cyan
-}
-
-function Write-OK {
-    param($msg)
-    Write-Host "  ✓ $msg" -ForegroundColor Green
-}
-
-function Write-Warn {
-    param($msg)
-    Write-Host "  ⚠ $msg" -ForegroundColor Yellow
-}
-
-function Write-Fail {
-    param($msg)
-    Write-Host "  ✗ $msg" -ForegroundColor Red
-}
-
-# ─── Check prerequisites ────────────────────────────────────────────────────────
-
-Write-Step "Checking prerequisites..."
-
-# Check MT5 is running
-$mt5Process = Get-Process -Name "terminal64" -ErrorAction SilentlyContinue
-if ($mt5Process) {
-    Write-OK "MetaTrader 5 is running (PID $($mt5Process.Id))"
-} else {
-    Write-Warn "MetaTrader 5 doesn't appear to be running."
-    Write-Host "  Please start MT5 and log in to account 1114231 (OxSecurities-Demo)" -ForegroundColor Yellow
-    $continue = Read-Host "  Press Enter to continue anyway, or Ctrl+C to cancel"
-}
-
-# Check Docker
-$dockerRunning = $false
+# --- Step 1: Check Docker ---
+Write-Host "[1/4] Checking Docker..." -ForegroundColor Yellow
 try {
     $null = docker info 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $dockerRunning = $true
-        Write-OK "Docker Desktop is running"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Docker is not running. Start Docker Desktop and try again." -ForegroundColor Red
+        pause
+        exit 1
     }
-} catch {}
-
-if (-not $dockerRunning -and -not $BridgeOnly) {
-    Write-Fail "Docker Desktop is not running. Please start Docker Desktop first."
-    Write-Host "  Download from: https://www.docker.com/products/docker-desktop" -ForegroundColor Yellow
+    Write-Host "      Docker is running." -ForegroundColor Green
+} catch {
+    Write-Host "ERROR: Docker not found. Install Docker Desktop from https://docker.com" -ForegroundColor Red
+    pause
     exit 1
 }
 
-# ─── Step 1: Start MT5 Bridge ───────────────────────────────────────────────────
+# --- Step 2: Start MT5 Bridge in new window ---
+Write-Host ""
+Write-Host "[2/4] Starting MT5 Python Bridge..." -ForegroundColor Yellow
+Write-Host "      (Opens a new window - keep it open while trading)"
 
-if (-not $DockerOnly) {
-    Write-Step "Starting MT5 Python Bridge (port 8000)..."
+$bridgePath = Join-Path $PSScriptRoot "integrations\mt5-bridge"
+if (Test-Path "$bridgePath\run.ps1") {
+    Start-Process powershell.exe -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$bridgePath\run.ps1`"" -WindowStyle Normal
+    Write-Host "      Bridge window launched. Waiting 10 seconds for it to start..." -ForegroundColor Green
+    Start-Sleep -Seconds 10
+} else {
+    Write-Host "      WARNING: MT5 bridge not found at $bridgePath" -ForegroundColor Yellow
+}
 
-    # Check if bridge is already running
-    try {
-        $health = Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 2 -ErrorAction Stop
-        if ($health.connected) {
-            Write-OK "MT5 Bridge already running and connected to account $($health.login) (Balance: `$$($health.balance))"
-        } else {
-            Write-Warn "MT5 Bridge running but not connected: $($health.error)"
-        }
-    } catch {
-        # Not running — start it
-        Write-Host "  Launching MT5 Bridge in a new terminal window..." -ForegroundColor White
-
-        Start-Process powershell -ArgumentList @(
-            "-NoExit",
-            "-Command",
-            "Set-Location '$BridgePath'; Write-Host 'MT5 Bridge starting...' -ForegroundColor Green; & '.\run.ps1'"
-        ) -WindowStyle Normal
-
-        # Wait for bridge to come up
-        Write-Host "  Waiting for bridge to start" -NoNewline
-        $maxWait = 30
-        $connected = $false
-        for ($i = 0; $i -lt $maxWait; $i++) {
-            Start-Sleep -Seconds 1
-            Write-Host "." -NoNewline
-            try {
-                $health = Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 1 -ErrorAction Stop
-                $connected = $true
-                break
-            } catch {}
-        }
-        Write-Host ""
-
-        if ($connected) {
-            if ($health.connected) {
-                Write-OK "MT5 Bridge connected! Account: $($health.login) | Balance: `$$($health.balance) | Server: $($health.server)"
-            } else {
-                Write-Warn "Bridge started but MT5 connection issue: $($health.error)"
-                Write-Host "  Check that MT5 is logged in to account 1114231 on OxSecurities-Demo" -ForegroundColor Yellow
-            }
-        } else {
-            Write-Warn "Bridge didn't respond in ${maxWait}s. Check the bridge window for errors."
-            Write-Host "  Common fix: MT5 terminal path may differ. Edit integrations/mt5-bridge/.env" -ForegroundColor Yellow
-        }
+# Check if bridge is up
+$bridgeOk = $false
+try {
+    $response = Invoke-WebRequest -Uri "http://localhost:8000/health" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+    if ($response.StatusCode -eq 200) {
+        $bridgeOk = $true
+        Write-Host "      MT5 Bridge is responding on port 8000." -ForegroundColor Green
     }
+} catch {
+    Write-Host "      WARNING: MT5 Bridge not responding yet. It may still be starting up." -ForegroundColor Yellow
+    Write-Host "      If MT5 connection fails, check the bridge window for errors." -ForegroundColor Yellow
+    Write-Host "      Common fix: update MT5_PATH in integrations\mt5-bridge\.env" -ForegroundColor Yellow
 }
 
-if ($BridgeOnly) {
-    Write-Host "`nBridge-only mode. Done." -ForegroundColor Green
-    exit 0
-}
+# --- Step 3: Build and start Docker services ---
+Write-Host ""
+Write-Host "[3/4] Building and starting Docker containers..." -ForegroundColor Yellow
+Write-Host "      This takes 1-3 minutes on first run, much faster after that."
+Write-Host ""
 
-# ─── Step 2: Start Docker services ─────────────────────────────────────────────
-
-Write-Step "Starting Docker services..."
-Set-Location $ScriptRoot
-
-Write-Host "  Building and starting all containers (this may take 2-3 minutes on first run)..."
 docker compose up --build -d
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Fail "Docker compose failed. Check errors above."
+    Write-Host ""
+    Write-Host "ERROR: Docker compose failed. See errors above." -ForegroundColor Red
+    pause
     exit 1
 }
 
-Write-OK "All Docker containers started"
+Write-Host ""
+Write-Host "      All containers started." -ForegroundColor Green
 
-# ─── Step 3: Health check ───────────────────────────────────────────────────────
+# --- Step 4: Wait for API ---
+Write-Host ""
+Write-Host "[4/4] Waiting for API to become ready..." -ForegroundColor Yellow
 
-Write-Step "Waiting for API to be ready..."
-$maxWait = 60
-for ($i = 0; $i -lt $maxWait; $i++) {
-    Start-Sleep -Seconds 2
+$apiReady = $false
+for ($i = 1; $i -le 30; $i++) {
+    Start-Sleep -Seconds 3
     try {
-        $api = Invoke-RestMethod -Uri "http://localhost:4210/health" -TimeoutSec 2 -ErrorAction Stop
-        Write-OK "API is ready"
-        break
-    } catch {
-        Write-Host "  Waiting... ($i/${maxWait}s)" -ForegroundColor DarkGray
-    }
+        $r = Invoke-WebRequest -Uri "http://localhost:4210/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        if ($r.StatusCode -eq 200) {
+            $apiReady = $true
+            break
+        }
+    } catch {}
+    Write-Host "      Waiting... ($($i * 3)s / 90s)" -ForegroundColor DarkGray
 }
 
-# ─── Done ───────────────────────────────────────────────────────────────────────
+Write-Host ""
+if ($apiReady) {
+    Write-Host "API is ready!" -ForegroundColor Green
+} else {
+    Write-Host "API did not respond in 90s. Check: docker compose logs api" -ForegroundColor Yellow
+}
 
+# --- Done ---
 Write-Host ""
-Write-Host "============================================================" -ForegroundColor Green
-Write-Host "  STOCKSSCALPER IS RUNNING" -ForegroundColor Green
-Write-Host "============================================================" -ForegroundColor Green
+Write-Host "======================================" -ForegroundColor Green
+Write-Host "  StocksScalper is running!" -ForegroundColor Green
+Write-Host "======================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Dashboard:    http://localhost:3210" -ForegroundColor White
-Write-Host "  API:          http://localhost:4210" -ForegroundColor White
-Write-Host "  MT5 Bridge:   http://localhost:8000/health" -ForegroundColor White
+Write-Host "  Dashboard : http://localhost:3210"
+Write-Host "  API       : http://localhost:4210"
+Write-Host "  MT5 Bridge: http://localhost:8000/health"
 Write-Host ""
-Write-Host "  Account:      Ekjot Singh (#1114231)" -ForegroundColor Cyan
-Write-Host "  Balance:      `$100,000 USD (OxSecurities-Demo)" -ForegroundColor Cyan
-Write-Host "  Mode:         PAPER (demo trades, no real money)" -ForegroundColor Yellow
+Write-Host "  To stop   : docker compose down"
+Write-Host "  To reset  : .\RESET.ps1"
+Write-Host "  To view logs: docker compose logs -f worker-market"
 Write-Host ""
-Write-Host "  To go LIVE: Change TRADING_MODE=live in .env.local" -ForegroundColor Yellow
-Write-Host "              then run: docker compose restart worker-execution" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  To stop:    docker compose down" -ForegroundColor DarkGray
-Write-Host "============================================================" -ForegroundColor Green
 
-# Open dashboard in browser
+# Open dashboard
 Start-Process "http://localhost:3210"
+
+Write-Host "Press any key to exit this window..."
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

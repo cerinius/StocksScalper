@@ -10,4 +10,4 @@ RUN npm run build:packages
 RUN npm run build -w apps/api
 
 EXPOSE 4210
-CMD ["sh", "-c", "until npm run prisma:migrate:deploy -w packages/db; do echo 'Waiting for database...'; sleep 2; done; npm run seed -w packages/db; npm run start -w apps/api"]
+CMD ["sh", "-c", "until npm run prisma:migrate:deploy -w packages/db; do echo 'Waiting for database...'; sleep 2; done; npm run seed -w packages/db && npm run start -w apps/api"]

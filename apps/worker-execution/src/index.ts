@@ -1,5 +1,5 @@
 import { getPlatformConfig } from "@stock-radar/config";
-import { calculatePearsonCorrelation, makeExecutionDecision } from "@stock-radar/core";
+import { calculatePearsonCorrelation, makeExecutionDecision, computeStreakRiskScale } from "@stock-radar/core";
 import { Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
@@ -45,15 +45,55 @@ type ExecutionPositionRecord = {
   };
 };
 
-const getDynamicRiskPerTradePct = async () => {
+const getDynamicRiskPerTradePct = async (account: { realizedPnlDaily: number; balance: number }) => {
   const setting = await prisma.systemSetting.findUnique({ where: { key: "risk.dynamicControls" } });
   const settingValue = asObject(setting?.value);
   const override = settingValue?.maxRiskPerTradePct;
-  if (typeof override !== "number" || !Number.isFinite(override)) {
-    return config.risk.maxRiskPerTradePct;
+  const supervisorBase = (typeof override === "number" && Number.isFinite(override))
+    ? Math.min(config.risk.maxRiskPerTradePct, Math.max(config.risk.minDynamicRiskPerTradePct, override))
+    : config.risk.maxRiskPerTradePct;
+
+  // Build streak context from recent closed positions
+  const recentClosed = await prisma.position.findMany({
+    where: { status: "CLOSED" },
+    orderBy: { closedAt: "desc" },
+    take: 20,
+    select: { realizedPnl: true, closedAt: true },
+  });
+
+  const recentOutcomes = recentClosed.map((p: { realizedPnl: number }) => p.realizedPnl > 0).reverse();
+  let consecutiveLosses = 0;
+  let consecutiveWins = 0;
+  for (let i = recentOutcomes.length - 1; i >= 0; i--) {
+    if (!recentOutcomes[i]) { consecutiveLosses++; if (consecutiveWins > 0) break; }
+    else break;
+  }
+  for (let i = recentOutcomes.length - 1; i >= 0; i--) {
+    if (recentOutcomes[i]) { consecutiveWins++; if (consecutiveLosses > 0) break; }
+    else break;
+  }
+  if (recentOutcomes.at(-1) === false) consecutiveWins = 0;
+  if (recentOutcomes.at(-1) === true) consecutiveLosses = 0;
+
+  const dailyPnlPct = account.balance > 0 ? (account.realizedPnlDaily / account.balance) * 100 : 0;
+
+  const streak = computeStreakRiskScale(supervisorBase, {
+    consecutiveLosses,
+    consecutiveWins,
+    recentOutcomes,
+    dailyPnlPct,
+  }, config.risk.maxDailyLossPct);
+
+  if (streak.scaleFactor !== 1.0) {
+    logger.info("Streak risk scale applied", {
+      base: supervisorBase,
+      scaled: streak.scaledRiskPct,
+      factor: streak.scaleFactor,
+      reason: streak.reason,
+    });
   }
 
-  return Math.min(config.risk.maxRiskPerTradePct, Math.max(config.risk.minDynamicRiskPerTradePct, override));
+  return Math.max(config.risk.minDynamicRiskPerTradePct, streak.scaledRiskPct);
 };
 
 const getQuote = async (symbol: string, mid: number) => {
@@ -118,7 +158,7 @@ const getMt5IntegrationId = async (): Promise<string | null> => {
   if (cachedMt5IntegrationId !== undefined) return cachedMt5IntegrationId;
   const integration = await prisma.integration.findFirst({ where: { kind: "MT5", enabled: true } });
   cachedMt5IntegrationId = integration?.id ?? null;
-  return cachedMt5IntegrationId;
+  return cachedMt5IntegrationId as string | null;
 };
 
 const getAccountSnapshot = async () => {
@@ -190,7 +230,7 @@ const evaluateExecution = async (candidateId?: string) => {
 
     const account = await getAccountSnapshot();
     const [dynamicRiskPerTradePct, openPositions, candidates] = await Promise.all([
-      getDynamicRiskPerTradePct(),
+      getDynamicRiskPerTradePct(account),
       prisma.position.findMany({
         where: { status: "OPEN" },
         include: { symbol: true },
