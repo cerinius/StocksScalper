@@ -21,6 +21,7 @@ export const metadata = {
 
 const navItems = [
   { href: "/", label: "Dashboard" },
+  { href: "/watchlists", label: "Watchlists" },
   { href: "/workers", label: "Workers" },
   { href: "/news", label: "News" },
   { href: "/trade-ideas", label: "Trade Ideas" },

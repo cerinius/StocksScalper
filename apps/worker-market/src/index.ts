@@ -1,5 +1,5 @@
 import { getPlatformConfig } from "@stock-radar/config";
-import { analyzeMarketCandidate, MassiveMarketDataProvider, MockMarketDataProvider, resolveMassiveSymbol } from "@stock-radar/core";
+import { analyzeMarketCandidate, createMarketDataProvider, MassiveMarketDataProvider, resolveMassiveSymbol } from "@stock-radar/core";
 import { AssetClass, Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
@@ -10,14 +10,7 @@ import WebSocket from "ws";
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-market");
-const provider =
-  config.dataProvider === "massive" && config.marketData.massive.apiKey
-    ? new MassiveMarketDataProvider({
-        apiKey: config.marketData.massive.apiKey,
-        restBaseUrl: config.marketData.massive.restBaseUrl,
-        watchlistSymbols: config.watchlistSymbols,
-      })
-    : new MockMarketDataProvider();
+const provider = createMarketDataProvider();
 const isMassiveProvider = provider instanceof MassiveMarketDataProvider;
 const queues = createPlatformQueues();
 const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
@@ -270,13 +263,26 @@ const scanSymbol = async (inputSymbol: string): Promise<{ candidatesFound: numbe
   return { candidatesFound, timeframesScanned };
 };
 
-const processMarketScan = async (symbols?: string[]) => {
-  const symbolsToScan = symbols?.length ? symbols : config.watchlistSymbols;
+const getWatchlistSymbols = async (): Promise<string[]> => {
+  const activeWatchlist = await prisma.watchlist.findFirst({
+    where: { isActive: true },
+    include: { items: { include: { symbol: true } } },
+  });
+
+  if (activeWatchlist && activeWatchlist.items.length > 0) {
+    return activeWatchlist.items.map((item) => item.symbol.ticker);
+  }
+
+  logger.warn("No active watchlist found, falling back to default symbols");
+  return config.watchlistFallbackSymbols;
+};
+
+const processMarketScan = async () => {
+  const symbolsToScan = await getWatchlistSymbols();
   const run = await createWorkerRun({
     workerType: "MARKET",
     queueName: queueNames.market,
-    jobName: symbols?.length ? "targetedScan" : "scanWatchlist",
-    payload: symbols?.length ? { symbols } : undefined,
+    jobName: "scanWatchlist",
   });
 
   try {
@@ -300,7 +306,7 @@ const processMarketScan = async (symbols?: string[]) => {
       symbolsScanned: symbolsToScan.length,
       timeframesScanned: totalTimeframes,
       candidatesFound: totalCandidates,
-      provider: config.dataProvider,
+      provider: config.marketDataProvider,
     });
 
     await upsertWorkerHeartbeat({
@@ -311,7 +317,7 @@ const processMarketScan = async (symbols?: string[]) => {
       metrics: {
         symbolsScanned: symbolsToScan.length,
         candidatesFound: totalCandidates,
-        provider: config.dataProvider,
+        provider: config.marketDataProvider,
       },
     });
   } catch (error) {
@@ -321,7 +327,6 @@ const processMarketScan = async (symbols?: string[]) => {
       workerType: "MARKET",
       message: err.message,
       stack: err.stack,
-      payload: symbols?.length ? { symbols } : undefined,
     });
     await upsertWorkerHeartbeat({
       workerType: "MARKET",
@@ -396,12 +401,13 @@ const startMassiveStream = (
   connect();
 };
 
-const startRealtimeStreams = () => {
+const startRealtimeStreams = async () => {
   if (!isMassiveProvider) return;
 
   const { websocketUrls, streamMinMovePct, streamCooldownMs } = config.marketData.massive;
+  const symbols = await getWatchlistSymbols();
 
-  for (const inputSymbol of config.watchlistSymbols) {
+  for (const inputSymbol of symbols) {
     try {
       const descriptor = resolveMassiveSymbol(inputSymbol);
       const wsUrl =
@@ -433,27 +439,26 @@ setInterval(() => {
   });
 }, 15_000);
 
-createPlatformWorker<{ symbols?: string[] }>(
+createPlatformWorker(
   queueNames.market,
   "worker-market",
-  async (payload) => {
-    await processMarketScan(payload.symbols);
+  async () => {
+    await processMarketScan();
   },
 );
 
-startRealtimeStreams();
+void startRealtimeStreams();
 
 void upsertWorkerHeartbeat({
   workerType: "MARKET",
   serviceName: "worker-market",
   status: "healthy",
   currentTask: "idle",
-  metrics: { provider: config.dataProvider, symbols: config.watchlistSymbols.length },
+  metrics: { provider: config.marketDataProvider },
 });
 
 logger.info("Market worker started", {
-  provider: config.dataProvider,
-  symbols: config.watchlistSymbols.length,
+  provider: config.marketDataProvider,
   timeframes: config.watchlistTimeframes.length,
   realtimeStreaming: isMassiveProvider,
 });

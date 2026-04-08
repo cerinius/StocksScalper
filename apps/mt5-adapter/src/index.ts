@@ -8,19 +8,51 @@ const config = getPlatformConfig();
 const logger = createLogger("mt5-adapter");
 const app = Fastify({ logger: false });
 
+const mt5BridgeUrl = process.env.MT5_BRIDGE_URL?.replace(/\/+$|$/, "") || "";
+const useLiveBridge = mt5BridgeUrl.length > 0;
+
+console.log('MT5_BRIDGE_URL:', process.env.MT5_BRIDGE_URL, 'mt5BridgeUrl:', mt5BridgeUrl, 'useLiveBridge:', useLiveBridge);
+
+const proxyToBridge = async (path: string, method: string = "GET", body?: unknown) => {
+  if (!useLiveBridge) {
+    throw new Error("MT5_BRIDGE_URL is not configured");
+  }
+
+  const url = `${mt5BridgeUrl}${path}`;
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await response.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+
+  return { status: response.status, data };
+};
+
 const state = {
   connected: false,
   mode: config.trading.mode,
   lastSyncAt: new Date().toISOString(),
   account: {
-    balance: 125_000,
-    equity: 125_000,
-    freeMargin: 110_000,
-    usedMargin: 15_000,
+    balance: 100_000,    // OxSecurities Demo: Ekjot Singh, Account 1114231
+    equity: 100_000,
+    freeMargin: 100_000,
+    usedMargin: 0,
     openPnl: 0,
     realizedPnlDaily: 0,
     drawdownPct: 0,
-    maxDrawdownPct: 2.8,
+    maxDrawdownPct: 2.5,
     riskState: "NORMAL" as const,
     killSwitchActive: false,
     mode: config.trading.mode,
@@ -45,14 +77,25 @@ const getSpreadPct = (symbol: string) => {
   return Number((base * connectionPenalty).toFixed(4));
 };
 
-app.get("/health", async () => ({
-  ok: true,
-  connected: state.connected,
-  mode: state.mode,
-  lastSyncAt: state.lastSyncAt,
-}));
+app.get("/health", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/health");
+    return reply.status(result.status).send(result.data);
+  }
 
-app.post("/connect", async (request) => {
+  return {
+    ok: true,
+    connected: state.connected,
+    mode: state.mode,
+    lastSyncAt: state.lastSyncAt,
+  };
+});
+
+app.post("/connect", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/connect", "POST", request.body);
+    return reply.status(result.status).send(result.data);
+  }
   const payload = mt5ConnectRequestSchema.parse(request.body);
   state.connected = true;
   state.mode = payload.mode;
@@ -62,19 +105,70 @@ app.post("/connect", async (request) => {
   return { connected: true, mode: payload.mode, lastSyncAt: state.lastSyncAt };
 });
 
-app.post("/disconnect", async () => {
+app.post("/disconnect", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/disconnect", "POST", request.body);
+    return reply.status(result.status).send(result.data);
+  }
+
   state.connected = false;
   state.lastSyncAt = new Date().toISOString();
   logger.info("MT5 adapter disconnected");
   return { connected: false, lastSyncAt: state.lastSyncAt };
 });
 
-app.get("/account", async () => state.account);
-app.get("/positions", async () => state.positions);
-app.get("/orders", async () => state.orders);
-app.get("/history", async () => state.closedPositions);
-app.get("/quote/:symbol", async (request) => {
-  const { symbol } = request.params as { symbol: string };
+app.get("/account", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/account");
+    if (result.status !== 200) {
+      return reply.status(result.status).send(result.data);
+    }
+    const data = result.data;
+    return {
+      balance: data.balance,
+      equity: data.equity,
+      freeMargin: data.equity, // approximate
+      usedMargin: 0,
+      lastSyncAt: new Date().toISOString()
+    };
+  }
+  return state.account;
+});
+
+app.get("/positions", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/positions");
+    return reply.status(result.status).send(result.data);
+  }
+  return state.positions;
+});
+
+app.get("/orders", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/orders");
+    return reply.status(result.status).send(result.data);
+  }
+  return state.orders;
+});
+
+app.get("/history", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/history");
+    return reply.status(result.status).send(result.data);
+  }
+  return state.closedPositions;
+});
+app.get<{ Params: { symbol: string } }>("/quote/:symbol", async (request, reply) => {
+  if (useLiveBridge) {
+    const { symbol } = request.params;
+    const query = request.query as { mid?: string };
+    const requestedMid = query.mid ? Number(query.mid) : undefined;
+    const path = `/quote/${encodeURIComponent(symbol)}${requestedMid ? `?mid=${requestedMid}` : ""}`;
+    const result = await proxyToBridge(path);
+    return reply.status(result.status).send(result.data);
+  }
+
+  const { symbol } = request.params;
   const query = request.query as { mid?: string };
   const requestedMid = query.mid ? Number(query.mid) : undefined;
   const mid = resolveMidPrice(symbol, requestedMid);
@@ -92,6 +186,10 @@ app.get("/quote/:symbol", async (request) => {
 });
 
 app.post("/orders", async (request, reply) => {
+  if (useLiveBridge) {
+    const result = await proxyToBridge("/orders/market", "POST", request.body);
+    return reply.status(result.status).send(result.data);
+  }
   if (!state.connected) {
     reply.code(409);
     return { error: "MT5 adapter is not connected." };
@@ -132,8 +230,15 @@ app.post("/orders", async (request, reply) => {
   return order;
 });
 
-app.post("/positions/:positionId/close", async (request, reply) => {
-  const { positionId } = request.params as { positionId: string };
+app.post<{ Params: { positionId: string } }>("/positions/:positionId/close", async (request, reply) => {
+  if (useLiveBridge) {
+    const { positionId } = request.params;
+    const body = { position_ticket: Number(positionId) };
+    const result = await proxyToBridge("/orders/close", "POST", body);
+    return reply.status(result.status).send(result.data);
+  }
+
+  const { positionId } = request.params;
   const index = state.positions.findIndex((position) => position.positionId === positionId);
   if (index === -1) {
     reply.code(404);
@@ -154,6 +259,7 @@ app.post("/positions/:positionId/close", async (request, reply) => {
   return { closed: true, position: closed };
 });
 
-app.listen({ port: config.ports.mt5Adapter, host: "0.0.0.0" }).then(() => {
-  logger.info("MT5 adapter listening", { port: config.ports.mt5Adapter });
+const adapterPort = Number(process.env.MT5_ADAPTER_PORT ?? "4310");
+app.listen({ port: adapterPort, host: "0.0.0.0" }).then(() => {
+  logger.info("MT5 adapter listening", { port: adapterPort });
 });

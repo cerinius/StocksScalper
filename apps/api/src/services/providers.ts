@@ -1,5 +1,6 @@
 import { getPlatformConfig } from "@stock-radar/config";
 import {
+  AlphaVantageMarketDataProvider,
   MassiveMarketDataProvider,
   MockMarketDataProvider,
   MockNewsProvider,
@@ -14,14 +15,19 @@ export interface ProviderBundle {
 
 export const createProviders = (): ProviderBundle => {
   const config = getPlatformConfig();
-  const marketProvider = config.dataProvider;
+  const marketProvider = config.marketDataProvider;
   const newsProvider = (process.env.NEWS_PROVIDER ?? "mock").toLowerCase();
 
   const market =
-    marketProvider === "massive" && config.marketData.massive.apiKey
+    marketProvider === "polygon" && config.marketData.massive.apiKey
       ? new MassiveMarketDataProvider({
           apiKey: config.marketData.massive.apiKey,
           restBaseUrl: config.marketData.massive.restBaseUrl,
+          watchlistSymbols: config.watchlistSymbols,
+        })
+      : marketProvider === "alpha_vantage" && config.marketData.alphaVantage.apiKey
+      ? new AlphaVantageMarketDataProvider({
+          apiKey: config.marketData.alphaVantage.apiKey,
           watchlistSymbols: config.watchlistSymbols,
         })
       : new MockMarketDataProvider();

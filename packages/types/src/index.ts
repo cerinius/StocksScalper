@@ -91,11 +91,28 @@ export interface MarketIndicatorSnapshot {
   rsi14: number;
   macd: number;
   macdSignal: number;
+  macdHistogram?: number;
   atr14: number;
   atrPct: number;
   volumeRatio: number;
   trendStrength: number;
   momentumScore: number;
+  // Enhanced indicators (optional for backward compatibility)
+  bbUpper?: number;
+  bbMiddle?: number;
+  bbLower?: number;
+  bbWidth?: number;
+  bbPercentB?: number;
+  stochRsiK?: number;
+  stochRsiD?: number;
+  obv?: number;
+  obvTrend?: number;    // OBV slope (positive = accumulation)
+  vwap?: number;
+  adx14?: number;
+  plusDI?: number;
+  minusDI?: number;
+  williamsR?: number;
+  cci20?: number;
 }
 
 export interface NewsIntelligenceRecord {

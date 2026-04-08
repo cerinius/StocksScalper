@@ -13,6 +13,7 @@ describe("setup detectors", () => {
       symbol: "TEST",
       bars,
       news: [{
+        id: "1",
         symbol: "TEST",
         publishedAt: new Date().toISOString(),
         headline: "Test",

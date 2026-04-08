@@ -1,7 +1,15 @@
 import { prisma } from "@stock-radar/db";
 
 export const getDashboardSummary = async () => {
-  const [account, activeTrades, recentActions, riskWarnings, heartbeats, dynamicRiskSetting] = await Promise.all([
+  const [
+    account,
+    activeTrades,
+    recentActions,
+    riskWarnings,
+    heartbeats,
+    dynamicRiskSetting,
+    activeWatchlist,
+  ] = await Promise.all([
     prisma.accountSnapshot.findFirst({ orderBy: { capturedAt: "desc" } }),
     prisma.position.count({ where: { status: "OPEN" } }),
     prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: 8 }),
@@ -14,11 +22,58 @@ export const getDashboardSummary = async () => {
     }),
     prisma.workerHeartbeat.findMany({ orderBy: { workerType: "asc" } }),
     prisma.systemSetting.findUnique({ where: { key: "risk.dynamicControls" } }),
+    prisma.watchlist.findFirst({
+      where: { isActive: true },
+      include: {
+        items: {
+          include: {
+            symbol: true,
+          },
+        },
+      },
+    }),
   ]);
   const dynamicRiskValue =
-    dynamicRiskSetting && typeof dynamicRiskSetting.value === "object" && dynamicRiskSetting.value && !Array.isArray(dynamicRiskSetting.value)
+    dynamicRiskSetting &&
+    typeof dynamicRiskSetting.value === "object" &&
+    dynamicRiskSetting.value &&
+    !Array.isArray(dynamicRiskSetting.value)
       ? (dynamicRiskSetting.value as { maxRiskPerTradePct?: number }).maxRiskPerTradePct
       : undefined;
+
+  const watchedSymbols = activeWatchlist?.items.map((item) => item.symbol.id) ?? [];
+
+  const [news, marketSnapshots] = await Promise.all([
+    prisma.newsItem.findMany({
+      where: {
+        symbolLinks: {
+          some: {
+            symbolId: {
+              in: watchedSymbols,
+            },
+          },
+        },
+      },
+      orderBy: {
+        originalTimestamp: "desc",
+      },
+      take: 10,
+    }),
+    prisma.marketSnapshot.findMany({
+      where: {
+        symbolId: {
+          in: watchedSymbols,
+        },
+      },
+      orderBy: {
+        snapshotAt: "desc",
+      },
+      take: 10,
+      include: {
+        symbol: true,
+      },
+    }),
+  ]);
 
   return {
     account,
@@ -40,5 +95,9 @@ export const getDashboardSummary = async () => {
     workerHealth: heartbeats,
     killSwitchActive: account?.killSwitchActive ?? false,
     dynamicMaxRiskPerTradePct: typeof dynamicRiskValue === "number" ? dynamicRiskValue : null,
+    activeWatchlist,
+    news,
+    marketSnapshots,
   };
 };
+

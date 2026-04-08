@@ -13,12 +13,16 @@ const envSchema = z.object({
   APP_NAME: z.string().default("stocks-scalper-platform"),
   DATABASE_URL: z.string().default("postgresql://stockradar:stockradar@localhost:55432/stockradar"),
   REDIS_URL: z.string().default("redis://localhost:56379"),
-  DATA_PROVIDER: z.enum(["mock", "massive"]).default("mock"),
-  MASSIVE_API_KEY: z.string().optional().default(""),
-  MASSIVE_REST_BASE_URL: z.string().default("https://api.massive.com"),
-  MASSIVE_WS_STOCKS_URL: z.string().default("wss://socket.massive.com/stocks"),
-  MASSIVE_WS_FOREX_URL: z.string().default("wss://socket.massive.com/forex"),
-  MASSIVE_WS_CRYPTO_URL: z.string().default("wss://socket.massive.com/crypto"),
+  MARKET_DATA_PROVIDER: z.enum(["mock", "polygon", "alpha_vantage", "yahoo_finance"]).default("yahoo_finance"),
+  POLYGON_API_KEY: z.string().optional().default(""),
+  // Alpha Vantage is used for news by default, but can be switched to Polygon/Finnhub
+  NEWS_PROVIDER: z.enum(["mock", "alpha_vantage", "polygon", "finnhub"]).default("finnhub"),
+  ALPHA_VANTAGE_API_KEY: z.string().optional().default(""),
+  FINNHUB_API_KEY: z.string().optional().default(""),
+  MASSIVE_REST_BASE_URL: z.string().default("https://api.polygon.io"),
+  MASSIVE_WS_STOCKS_URL: z.string().default("wss://socket.polygon.io/stocks"),
+  MASSIVE_WS_FOREX_URL: z.string().default("wss://socket.polygon.io/forex"),
+  MASSIVE_WS_CRYPTO_URL: z.string().default("wss://socket.polygon.io/crypto"),
   MASSIVE_STREAM_MIN_MOVE_PCT: z.coerce.number().positive().default(0.12),
   MASSIVE_STREAM_COOLDOWN_MS: z.coerce.number().int().positive().default(15_000),
   API_PORT: z.coerce.number().int().positive().default(4210),
@@ -34,6 +38,9 @@ const envSchema = z.object({
   NEXT_PUBLIC_GATEWAY_BASE: z.string().default("http://localhost:4211"),
   DISCORD_WEBHOOK_URL: z.string().optional().default(""),
   TRADINGVIEW_WEBHOOK_SECRET: z.string().default("local-tv-secret"),
+  WATCHLIST_FALLBACK_SYMBOLS: z
+    .string()
+    .default("AAPL,MSFT,NVDA,AMD,TSLA,SPY,QQQ,EURUSD,XAUUSD,BTCUSD,ETHUSD"),
   WATCHLIST_SYMBOLS: z.string().default("AAPL,MSFT,NVDA,AMD,TSLA,SPY,QQQ,EURUSD,XAUUSD,BTCUSD,ETHUSD"),
   WATCHLIST_TIMEFRAMES: z.string().default("1m,5m,15m,1h,1d"),
   NEWS_URGENT_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
@@ -75,7 +82,7 @@ export interface PlatformConfig {
   nodeEnv: "development" | "test" | "production";
   databaseUrl: string;
   redisUrl: string;
-  dataProvider: "mock" | "massive";
+  marketDataProvider: "mock" | "polygon" | "alpha_vantage" | "yahoo_finance";
   ports: {
     api: number;
     web: number;
@@ -93,13 +100,22 @@ export interface PlatformConfig {
   };
   discordWebhookUrl: string;
   tradingViewWebhookSecret: string;
+  watchlistFallbackSymbols: string[];
   watchlistSymbols: string[];
   watchlistTimeframes: Timeframe[];
   news: {
+    provider: "mock" | "alpha_vantage" | "polygon" | "finnhub";
     limit: number;
     sendLatestOnStartup: boolean;
+    alphaVantage: {
+      apiKey: string;
+    };
+    finnhub: {
+      apiKey: string;
+    };
   };
   marketData: {
+    // Note: "massive" is the legacy name for Polygon.io
     massive: {
       apiKey: string;
       restBaseUrl: string;
@@ -110,6 +126,9 @@ export interface PlatformConfig {
       };
       streamMinMovePct: number;
       streamCooldownMs: number;
+    };
+    alphaVantage: {
+      apiKey: string;
     };
   };
   schedules: {
@@ -171,7 +190,7 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
     nodeEnv: parsed.NODE_ENV,
     databaseUrl: parsed.DATABASE_URL,
     redisUrl: parsed.REDIS_URL,
-    dataProvider: parsed.DATA_PROVIDER,
+    marketDataProvider: parsed.MARKET_DATA_PROVIDER,
     ports: {
       api: parsed.API_PORT,
       web: parsed.WEB_PORT,
@@ -189,15 +208,23 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
     },
     discordWebhookUrl: parsed.DISCORD_WEBHOOK_URL,
     tradingViewWebhookSecret: parsed.TRADINGVIEW_WEBHOOK_SECRET,
+    watchlistFallbackSymbols: splitCsv(parsed.WATCHLIST_FALLBACK_SYMBOLS),
     watchlistSymbols: splitCsv(parsed.WATCHLIST_SYMBOLS),
     watchlistTimeframes: parseTimeframes(parsed.WATCHLIST_TIMEFRAMES),
     news: {
+      provider: parsed.NEWS_PROVIDER,
       limit: parsed.NEWS_LIMIT,
       sendLatestOnStartup: parsed.SEND_LATEST_ON_STARTUP,
+      alphaVantage: {
+        apiKey: parsed.ALPHA_VANTAGE_API_KEY,
+      },
+      finnhub: {
+        apiKey: parsed.FINNHUB_API_KEY ?? "",
+      },
     },
     marketData: {
       massive: {
-        apiKey: parsed.MASSIVE_API_KEY,
+        apiKey: parsed.POLYGON_API_KEY,
         restBaseUrl: parsed.MASSIVE_REST_BASE_URL,
         websocketUrls: {
           stocks: parsed.MASSIVE_WS_STOCKS_URL,
@@ -206,6 +233,9 @@ export const getPlatformConfig = (env: NodeJS.ProcessEnv = process.env): Platfor
         },
         streamMinMovePct: parsed.MASSIVE_STREAM_MIN_MOVE_PCT,
         streamCooldownMs: parsed.MASSIVE_STREAM_COOLDOWN_MS,
+      },
+      alphaVantage: {
+        apiKey: parsed.ALPHA_VANTAGE_API_KEY,
       },
     },
     schedules: {

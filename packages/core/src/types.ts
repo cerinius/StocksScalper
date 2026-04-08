@@ -33,6 +33,7 @@ export interface DailyBar {
 }
 
 export interface NewsItem {
+  id: string;
   symbol: string;
   publishedAt: string;
   headline: string;
@@ -40,6 +41,8 @@ export interface NewsItem {
   url: string;
   summary?: string;
   tags?: string[];
+  sentiment?: string;
+  sentimentScore?: number;
 }
 
 export interface UniverseCandidate {

@@ -25,6 +25,24 @@ services:
       timeout: 5s
       retries: 10
 
+  # ─── MT5 Adapter ────────────────────────────────────────────────────────────
+  # Bridges Docker containers to the MT5 Python bridge running on the Windows host.
+  # The bridge itself (integrations/mt5-bridge) must be started first via START.ps1.
+  # Note: health check proxies to the MT5 bridge; use service_started so Docker
+  #       doesn't block startup if MT5 isn't connected yet.
+  mt5-adapter:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mt5-adapter
+    env_file:
+      - .env.local
+    environment:
+      MT5_BRIDGE_URL: http://host.docker.internal:8000
+      MT5_ADAPTER_PORT: 4310
+    ports:
+      - "${MT5_ADAPTER_PORT:-4310}:4310"
+    restart: unless-stopped
+
   api:
     build:
       context: .
@@ -48,6 +66,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mt5-adapter:
+        condition: service_started
     ports:
       - "${API_PORT:-4210}:4210"
     healthcheck:
@@ -77,22 +97,6 @@ services:
       timeout: 5s
       retries: 12
 
-  mt5-adapter:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.mt5-adapter
-    env_file:
-      - .env.local
-    environment:
-      MT5_ADAPTER_PORT: 4310
-    ports:
-      - "${MT5_ADAPTER_PORT:-4310}:4310"
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4310/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-
   worker-news:
     build:
       context: .
@@ -105,6 +109,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
   worker-market:
     build:
@@ -115,10 +120,10 @@ services:
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
-      DATA_PROVIDER: ${DATA_PROVIDER:-massive}
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
   worker-validation:
     build:
@@ -132,6 +137,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
   worker-execution:
     build:
@@ -147,7 +153,8 @@ services:
       api:
         condition: service_healthy
       mt5-adapter:
-        condition: service_healthy
+        condition: service_started
+    restart: unless-stopped
 
   worker-supervisor:
     build:
@@ -161,6 +168,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
   web:
     build:

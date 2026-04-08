@@ -22,6 +22,7 @@ import { backtestRoutes } from "./routes/backtests";
 import { journalRoutes } from "./routes/journal";
 import { setupRoutes } from "./routes/setups";
 import { symbolRoutes } from "./routes/symbols";
+import watchlistRoutes from "./routes/watchlists";
 
 const config = getPlatformConfig();
 const logger = createLogger("api");
@@ -71,6 +72,7 @@ const start = async () => {
 
   // Backtest/report endpoints
   await backtestRoutes(app);
+  await app.register(watchlistRoutes);
 
   await app.listen({ port: config.ports.api, host: "0.0.0.0" });
   logger.info("API listening", { port: config.ports.api });

@@ -1,3 +1,17 @@
+/**
+ * Market Regime Detection — Enhanced
+ *
+ * Uses EMA alignment, ATR/volatility, volume, momentum, ADX, and Bollinger
+ * Band width to classify market conditions and select the best strategy type.
+ *
+ * Regimes:
+ *   bull_trend           → Uptrend with contained volatility
+ *   bear_trend           → Downtrend with contained volatility
+ *   range_mean_reversion → Sideways, oscillating between support/resistance
+ *   breakout_expansion   → Price + volume surging out of consolidation
+ *   volatile_reversal    → High volatility with directional exhaustion signals
+ */
+
 import type { MarketIndicatorSnapshot, PriceBar, TradeDirection } from "@stock-radar/types";
 import { clamp, percentChange } from "@stock-radar/shared";
 
@@ -16,59 +30,135 @@ const averageRangePct = (bars: PriceBar[]) => {
 
 export const detectMarketRegime = (
   bars: PriceBar[],
-  indicatorSnapshot: MarketIndicatorSnapshot,
+  ind: MarketIndicatorSnapshot,
 ): MarketRegimeAssessment => {
   const latest = bars.at(-1);
   const anchor = bars.at(-20);
   const priceMomentumPct = latest && anchor ? percentChange(anchor.close, latest.close) : 0;
   const realizedRangePct = averageRangePct(bars.slice(-12));
-  const trendStrength = indicatorSnapshot.trendStrength;
-  const isTrending = Math.abs(trendStrength) >= 24;
-  const isHighVolatility = indicatorSnapshot.atrPct >= 2.8 || realizedRangePct >= 1.9;
-  const isRangeBound = Math.abs(trendStrength) <= 12 && indicatorSnapshot.rsi14 >= 38 && indicatorSnapshot.rsi14 <= 62;
-  const isBreakout =
-    indicatorSnapshot.volumeRatio >= 1.12 &&
-    Math.abs(indicatorSnapshot.momentumScore) >= 45 &&
-    (Math.abs(priceMomentumPct) >= 1.4 || isHighVolatility);
 
-  if (isTrending && !isHighVolatility) {
-    const bullish = trendStrength >= 0;
+  // ── Signal extraction ──────────────────────────────────────────────────────
+
+  const trendStrength = ind.trendStrength;
+
+  // ADX: strong trend = >25, very strong = >40
+  const adx = ind.adx14 ?? 0;
+  const adxStrong = adx > 25;
+  const adxVeryStrong = adx > 40;
+  const plusDI = ind.plusDI ?? 0;
+  const minusDI = ind.minusDI ?? 0;
+  const diDirection: TradeDirection | "NEUTRAL" = adx > 15 ? (plusDI > minusDI ? "LONG" : "SHORT") : "NEUTRAL";
+
+  // Bollinger Band width: tight = squeeze/consolidation, wide = expansion
+  const bbWidth = ind.bbWidth ?? 0;
+  const bbSqueeze = bbWidth > 0 && bbWidth < 0.015; // Very tight bands
+  const bbExpansion = bbWidth > 0.04;               // Wide bands (expansion)
+
+  // Volatility flags
+  const isHighVolatility = ind.atrPct >= 2.8 || realizedRangePct >= 1.9;
+
+  // OBV trend confirmation
+  const obvTrend = ind.obvTrend ?? 0;
+  const obvBullish = obvTrend > 15;
+  const obvBearish = obvTrend < -15;
+
+  // Trend detection: EMAs aligned + ADX confirms
+  const isTrendingByEma = Math.abs(trendStrength) >= 22;
+  const isTrendingByAdx = adxStrong;
+  const isTrending = (isTrendingByEma || isTrendingByAdx) && !isHighVolatility;
+
+  // Range-bound: tight EMA spread + RSI mid-zone + BB not wide
+  const isRangeBound =
+    Math.abs(trendStrength) <= 14 &&
+    ind.rsi14 >= 36 && ind.rsi14 <= 64 &&
+    !bbExpansion;
+
+  // Breakout: volume surging + momentum high + BB expanding or price at BB upper/lower
+  const bbPercentB = ind.bbPercentB ?? 0.5;
+  const atBbEdge = bbPercentB > 0.90 || bbPercentB < 0.10;
+  const isBreakout =
+    ind.volumeRatio >= 1.10 &&
+    Math.abs(ind.momentumScore) >= 40 &&
+    (Math.abs(priceMomentumPct) >= 1.2 || isHighVolatility || atBbEdge || bbSqueeze);
+
+  // ── Classify ───────────────────────────────────────────────────────────────
+
+  if (isTrending) {
+    const bullish = adxStrong ? diDirection === "LONG" : trendStrength >= 0;
+    const bullOBV = bullish ? obvBullish : obvBearish;
+    const confidence = clamp(
+      Math.abs(trendStrength) * 1.0 +
+      Math.abs(priceMomentumPct) * 5 +
+      (adxStrong ? adx * 0.4 : 0) +
+      (bullOBV ? 8 : 0),
+      35,
+      96,
+    );
     return {
       regime: bullish ? "bull_trend" : "bear_trend",
-      confidence: clamp(Math.abs(trendStrength) * 1.1 + Math.abs(priceMomentumPct) * 6, 35, 95),
+      confidence,
       preferredStrategy: "trend",
       directionBias: bullish ? "LONG" : "SHORT",
       summary: bullish
-        ? "Steady directional trend with contained volatility."
-        : "Persistent downside trend with orderly volatility.",
+        ? `Uptrend confirmed — EMA aligned, ADX ${adx.toFixed(0)}, OBV ${obvTrend > 0 ? "accumulating" : "neutral"}.`
+        : `Downtrend confirmed — EMA inverted, ADX ${adx.toFixed(0)}, OBV ${obvTrend < 0 ? "distributing" : "neutral"}.`,
     };
   }
 
   if (isBreakout) {
+    const bullBreak = trendStrength >= 0;
+    const confidence = clamp(
+      Math.abs(ind.momentumScore) * 0.85 +
+      ind.volumeRatio * 16 +
+      (bbExpansion ? 10 : 0) +
+      (atBbEdge ? 8 : 0),
+      40,
+      97,
+    );
     return {
       regime: "breakout_expansion",
-      confidence: clamp(Math.abs(indicatorSnapshot.momentumScore) * 0.9 + indicatorSnapshot.volumeRatio * 18, 40, 97),
+      confidence,
       preferredStrategy: "breakout",
-      directionBias: trendStrength >= 0 ? "LONG" : "SHORT",
-      summary: "Momentum and volume are expanding together, favoring continuation or range escape.",
+      directionBias: bullBreak ? "LONG" : "SHORT",
+      summary: `${bbSqueeze ? "Squeeze breakout" : "Momentum breakout"} — volume ${ind.volumeRatio.toFixed(2)}x, BB width ${(bbWidth * 100).toFixed(1)}%.`,
     };
   }
 
   if (isRangeBound) {
+    const confidence = clamp(
+      64 - Math.abs(trendStrength) +
+      (65 - Math.abs(ind.rsi14 - 50)) +
+      (bbSqueeze ? 5 : 0),
+      30,
+      88,
+    );
     return {
       regime: "range_mean_reversion",
-      confidence: clamp(62 - Math.abs(trendStrength) + (65 - Math.abs(indicatorSnapshot.rsi14 - 50)), 30, 88),
+      confidence,
       preferredStrategy: "mean_reversion",
       directionBias: "NEUTRAL",
-      summary: "Trend is muted and the tape is behaving like a mean-reversion range.",
+      summary: `Ranging market — BB width ${(bbWidth * 100).toFixed(1)}%, RSI ${ind.rsi14.toFixed(0)}, low ADX ${adx.toFixed(0)}.`,
     };
   }
 
+  // Default: volatile/reversal
+  const reversalBias: TradeDirection | "NEUTRAL" =
+    diDirection !== "NEUTRAL" ? diDirection :
+    ind.rsi14 <= 35 ? "LONG" :
+    ind.rsi14 >= 65 ? "SHORT" :
+    "NEUTRAL";
+
   return {
     regime: "volatile_reversal",
-    confidence: clamp(indicatorSnapshot.atrPct * 16 + Math.abs(indicatorSnapshot.momentumScore) * 0.35, 30, 92),
+    confidence: clamp(
+      ind.atrPct * 14 +
+      Math.abs(ind.momentumScore) * 0.3 +
+      (adxStrong ? 10 : 0),
+      30,
+      92,
+    ),
     preferredStrategy: "reversal",
-    directionBias: indicatorSnapshot.rsi14 <= 45 ? "LONG" : indicatorSnapshot.rsi14 >= 55 ? "SHORT" : "NEUTRAL",
-    summary: "Volatility is elevated enough that reversals and failed breaks matter more than smooth trends.",
+    directionBias: reversalBias,
+    summary: `High-volatility environment — ATR ${ind.atrPct.toFixed(1)}%, ADX ${adx.toFixed(0)}, StochRSI K=${(ind.stochRsiK ?? 50).toFixed(0)}.`,
   };
 };

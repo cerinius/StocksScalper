@@ -70,18 +70,29 @@ export class MockMarketDataProvider implements MarketDataProvider {
 export class MockNewsProvider implements NewsProvider {
   async getNews(symbol: string, days: number): Promise<NewsItem[]> {
     return Array.from({ length: Math.min(days, 3) }).map((_, idx) => ({
+      id: `${symbol}-${idx}`,
       symbol,
       publishedAt: new Date(Date.now() - idx * 86_400_000).toISOString(),
       headline: `${symbol} catalyst update ${idx + 1}`,
       source: "MockWire",
       url: `https://example.com/${symbol}/${idx}`,
       summary: "Mock news item for offline development.",
-      tags: ["earnings", "guidance"].slice(0, idx + 1),
+      tags: ["earnings", "guidance"].slice(0, 1),
     }));
+  }
+
+  async getNewsForSymbols(symbols: string[], limitPerSymbol: number): Promise<NewsItem[]> {
+    const allNews: NewsItem[] = [];
+    for (const symbol of symbols) {
+      const news = await this.getNews(symbol, limitPerSymbol);
+      allNews.push(...news);
+    }
+    return allNews;
   }
 
   async getMacroNews(limit: number): Promise<NewsItem[]> {
     return Array.from({ length: limit }).map((_, idx) => ({
+      id: `macro-${idx}`,
       symbol: idx % 2 === 0 ? "SPY" : "XAUUSD",
       publishedAt: new Date(Date.now() - idx * 3_600_000).toISOString(),
       headline: createMockHeadline(idx % 2 === 0 ? "SPY" : "XAUUSD", idx),

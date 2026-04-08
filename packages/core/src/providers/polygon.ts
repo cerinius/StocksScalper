@@ -41,6 +41,7 @@ export class PolygonNewsProvider implements NewsProvider {
 
   private buildItem(article: PolygonNewsArticle): NewsItem {
     return {
+      id: article.id,
       symbol: article.tickers && article.tickers.length > 0 ? getSymbolTag(article.tickers[0]) : "",
       publishedAt: article.published_utc,
       headline: article.title,
@@ -68,6 +69,17 @@ export class PolygonNewsProvider implements NewsProvider {
     const limit = Math.max(20, Math.min(days * 15, 200));
     const articles = await this.request(`/v2/reference/news?tickers=${encodeURIComponent(symbol)}&limit=${limit}`);
     return articles.map((article) => this.buildItem(article));
+  }
+
+  async getNewsForSymbols(symbols: string[], limitPerSymbol: number): Promise<NewsItem[]> {
+    const allNews: NewsItem[] = [];
+    for (const symbol of symbols) {
+      // This is not efficient, but it's a simple way to implement the interface.
+      // A better implementation would be to use a single API call if the provider supports it.
+      const news = await this.getNews(symbol, limitPerSymbol);
+      allNews.push(...news);
+    }
+    return allNews;
   }
 
   async getMacroNews(limit: number): Promise<NewsItem[]> {
