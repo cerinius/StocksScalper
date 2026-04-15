@@ -182,6 +182,244 @@ const maybeThrottleRisk = async (
   };
 };
 
+// ─── MT5 Position & Account Sync ─────────────────────────────────────────────
+
+/**
+ * Fetch live account state from MT5 adapter and write an AccountSnapshot.
+ * This is what drives the Balance / Equity / PnL cards on the dashboard.
+ */
+const syncMT5Account = async () => {
+  const url = `${config.services.mt5AdapterUrl}/account`;
+  let data: Record<string, unknown>;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) {
+      logger.warn("MT5 account sync skipped — adapter returned non-200", { status: res.status });
+      return;
+    }
+    data = (await res.json()) as Record<string, unknown>;
+  } catch (err) {
+    logger.warn("MT5 account sync failed — adapter unreachable", { error: (err as Error).message });
+    return;
+  }
+
+  const num = (key: string, fallback = 0) =>
+    typeof data[key] === "number" ? (data[key] as number) : fallback;
+
+  const integration = await prisma.integration.findFirst({ where: { kind: "MT5" } });
+
+  await prisma.accountSnapshot.create({
+    data: {
+      integrationId: integration?.id ?? null,
+      balance: num("balance"),
+      equity: num("equity"),
+      freeMargin: num("freeMargin"),
+      usedMargin: num("usedMargin"),
+      marginLevel: num("usedMargin") > 0
+        ? (num("equity") / num("usedMargin")) * 100
+        : 0,
+      openPnl: num("openPnl"),
+      realizedPnlDaily: num("realizedPnlDaily"),
+      drawdownPct: num("drawdownPct"),
+      maxDrawdownPct: num("maxDrawdownPct", 2.5),
+      riskState: (["NORMAL", "CAUTION", "BLOCKED", "KILL_SWITCH"].includes(String(data.riskState))
+        ? data.riskState
+        : "NORMAL") as "NORMAL" | "CAUTION" | "BLOCKED" | "KILL_SWITCH",
+      killSwitchActive: data.killSwitchActive === true,
+      mode: typeof data.mode === "string" ? data.mode.toUpperCase() as "PAPER" | "LIVE" : "PAPER",
+    },
+  });
+
+  logger.info("Account snapshot written", {
+    balance: num("balance"),
+    equity: num("equity"),
+    openPnl: num("openPnl"),
+    riskState: data.riskState,
+  });
+};
+
+/**
+ * Fetch live MT5 positions and reconcile with the DB:
+ *   - Positions in MT5 but not DB → INSERT (externally opened trades are visible on dashboard)
+ *   - Positions in DB (OPEN) but not in MT5 → CLOSE them (MT5 is the source of truth)
+ *   - Positions in both → UPDATE unrealized PnL from live MT5 data
+ */
+const syncMT5Positions = async () => {
+  const url = `${config.services.mt5AdapterUrl}/positions`;
+  let mt5Positions: Array<{
+    ticket: number;
+    symbol: string;
+    type: string;
+    volume: number;
+    price_open: number;
+    sl: number;
+    tp: number;
+    profit: number;
+  }>;
+
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) {
+      logger.warn("MT5 position sync skipped — adapter returned non-200", { status: res.status });
+      return;
+    }
+    mt5Positions = (await res.json()) as typeof mt5Positions;
+  } catch (err) {
+    logger.warn("MT5 position sync failed — adapter unreachable", { error: (err as Error).message });
+    return;
+  }
+
+  if (!Array.isArray(mt5Positions)) return;
+
+  // Load all open DB positions
+  const dbPositions = await prisma.position.findMany({
+    where: { status: "OPEN" },
+    include: { symbol: true },
+  });
+
+  const dbByTicket = new Map(
+    dbPositions
+      .filter((p) => p.brokerPositionId != null)
+      .map((p) => [String(p.brokerPositionId), p]),
+  );
+
+  const mt5TicketSet = new Set(mt5Positions.map((p) => String(p.ticket)));
+
+  // ── 1. Update existing or create new positions from MT5 ──────────────────
+  for (const mp of mt5Positions) {
+    const ticketKey = String(mp.ticket);
+    const direction: "LONG" | "SHORT" = mp.type === "buy" ? "LONG" : "SHORT";
+    const existing = dbByTicket.get(ticketKey);
+
+    if (existing) {
+      // Update unrealized PnL live from MT5
+      await prisma.position.update({
+        where: { id: existing.id },
+        data: { unrealizedPnl: mp.profit },
+      });
+    } else {
+      // New position in MT5 not yet in DB — find or derive the symbol
+      const rawTicker = mp.symbol.toUpperCase();
+      // Try exact match first, then strip broker suffixes (.PRO, .m, etc.)
+      const cleanTicker = rawTicker.replace(/\.(PRO|m|ECN|RAW|PLUS)$/i, "");
+
+      let symbol = await prisma.symbol.findFirst({
+        where: { ticker: { in: [rawTicker, cleanTicker] } },
+      });
+
+      if (!symbol) {
+        // Auto-create symbol so the position can be tracked
+        const assetClass =
+          ["BTC", "ETH", "SOL", "LTC", "XRP"].some((c) => cleanTicker.includes(c))
+            ? "CRYPTO"
+            : ["XAU", "XAG", "OIL", "BRENT"].some((c) => cleanTicker.includes(c))
+              ? "COMMODITY"
+              : cleanTicker.length === 6 &&
+                ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD"].some((c) =>
+                  cleanTicker.startsWith(c) || cleanTicker.endsWith(c)
+                )
+                ? "FX"
+                : "EQUITY";
+
+        symbol = await prisma.symbol.upsert({
+          where: { ticker: cleanTicker },
+          update: {},
+          create: {
+            ticker: cleanTicker,
+            name: cleanTicker,
+            assetClass: assetClass as never,
+            isActive: true,
+          },
+        });
+      }
+
+      await prisma.position.create({
+        data: {
+          symbolId: symbol.id,
+          brokerPositionId: ticketKey,
+          direction,
+          quantity: mp.volume,
+          avgEntryPrice: mp.price_open,
+          stopLoss: mp.sl > 0 ? mp.sl : mp.price_open * (direction === "LONG" ? 0.98 : 1.02),
+          takeProfit: mp.tp > 0 ? mp.tp : mp.price_open * (direction === "LONG" ? 1.04 : 0.96),
+          unrealizedPnl: mp.profit,
+          realizedPnl: 0,
+          exposurePct: 1.0,
+          status: "OPEN",
+          openedAt: new Date(),
+          metadata: { source: "mt5_sync", ticket: mp.ticket },
+        },
+      });
+
+      logger.info("MT5 position imported to DB", {
+        symbol: mp.symbol,
+        direction,
+        volume: mp.volume,
+        ticket: mp.ticket,
+        profit: mp.profit,
+      });
+
+      await prisma.auditLog.create({
+        data: {
+          actorType: "WORKER",
+          actorId: "worker-supervisor",
+          workerType: "SUPERVISOR",
+          severity: "INFO",
+          category: "mt5_sync",
+          message: `Imported MT5 position ticket ${mp.ticket} (${mp.symbol} ${direction} ${mp.volume} lots @ ${mp.price_open})`,
+          entityType: "position",
+          entityId: ticketKey,
+          symbolId: symbol.id,
+        },
+      });
+    }
+  }
+
+  // ── 2. Close DB positions that are no longer open in MT5 ─────────────────
+  for (const dbPos of dbPositions) {
+    if (!dbPos.brokerPositionId) continue; // system-generated, skip
+    if (mt5TicketSet.has(dbPos.brokerPositionId)) continue; // still open in MT5
+
+    await prisma.position.update({
+      where: { id: dbPos.id },
+      data: {
+        status: "CLOSED",
+        closedAt: new Date(),
+        realizedPnl: dbPos.unrealizedPnl, // best approximation at close
+        unrealizedPnl: 0,
+      },
+    });
+
+    logger.info("DB position marked CLOSED (no longer in MT5)", {
+      symbol: dbPos.symbol.ticker,
+      ticket: dbPos.brokerPositionId,
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actorType: "WORKER",
+        actorId: "worker-supervisor",
+        workerType: "SUPERVISOR",
+        severity: "INFO",
+        category: "mt5_sync",
+        message: `Position ticket ${dbPos.brokerPositionId} (${dbPos.symbol.ticker}) closed in MT5 — marked CLOSED in DB`,
+        entityType: "position",
+        entityId: dbPos.id,
+        symbolId: dbPos.symbolId,
+      },
+    });
+  }
+
+  if (mt5Positions.length > 0) {
+    logger.info("MT5 position sync complete", {
+      mt5Count: mt5Positions.length,
+      dbCount: dbPositions.length,
+    });
+  }
+};
+
+// ─── Price Bar Helpers ────────────────────────────────────────────────────────
+
 /** Fetch recent price bars for a symbol+timeframe from the DB */
 const getRecentBars = async (symbolId: string, timeframe: string, take = 30): Promise<PriceBar[]> => {
   const rows = await prisma.priceBar.findMany({
@@ -328,6 +566,12 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
         prisma.workerHeartbeat.findMany({ orderBy: { workerType: "asc" } }),
         prisma.accountSnapshot.findFirst({ orderBy: { capturedAt: "desc" } }),
       ]);
+
+      // Sync live MT5 account state → AccountSnapshot (drives dashboard balance/equity/PnL)
+      await syncMT5Account();
+
+      // Sync live MT5 positions → DB (reconcile open/closed, import new)
+      await syncMT5Positions();
 
       // Manage ATR trailing stops on all open positions
       await manageTrailingStops();

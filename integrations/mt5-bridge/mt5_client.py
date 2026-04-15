@@ -82,6 +82,17 @@ class MT5Client:
         order_type = mt5.ORDER_TYPE_BUY if side_normalized == "buy" else mt5.ORDER_TYPE_SELL
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
+        # Auto-detect the filling mode supported by this broker/symbol.
+        # filling_mode is a bitmask: 1=FOK, 2=IOC, 4=RETURN.
+        # Prefer RETURN (partial fills), then FOK, then IOC.
+        filling_mode_flags = symbol_info.filling_mode
+        if filling_mode_flags & 4:
+            filling = mt5.ORDER_FILLING_RETURN
+        elif filling_mode_flags & 1:
+            filling = mt5.ORDER_FILLING_FOK
+        else:
+            filling = mt5.ORDER_FILLING_IOC
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -94,7 +105,7 @@ class MT5Client:
             "magic": 100100,
             "comment": comment or "API order",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling,
         }
 
         result = mt5.order_send(request)
@@ -147,6 +158,15 @@ class MT5Client:
         )
         price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
 
+        # Auto-detect the filling mode supported by this broker/symbol.
+        filling_mode_flags = symbol_info.filling_mode
+        if filling_mode_flags & 4:
+            filling = mt5.ORDER_FILLING_RETURN
+        elif filling_mode_flags & 1:
+            filling = mt5.ORDER_FILLING_FOK
+        else:
+            filling = mt5.ORDER_FILLING_IOC
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": pos.symbol,
@@ -158,7 +178,7 @@ class MT5Client:
             "magic": 100100,
             "comment": "API Close",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": filling,
         }
 
         result = mt5.order_send(request)

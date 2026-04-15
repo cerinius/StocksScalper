@@ -369,10 +369,11 @@ const evaluateExecution = async (candidateId?: string) => {
           status?: string;
           reason?: string;
           error?: string;
+          detail?: string; // FastAPI returns errors as { detail: "..." }
         };
 
         if (!response.ok) {
-          const errorMessage = orderResult.reason ?? orderResult.error ?? `Broker rejected order with status ${response.status}.`;
+          const errorMessage = orderResult.reason ?? orderResult.error ?? orderResult.detail ?? `Broker rejected order with status ${response.status}.`;
 
           await prisma.executionDecision.update({
             where: { id: decisionRecord.id },

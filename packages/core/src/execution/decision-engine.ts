@@ -166,9 +166,38 @@ export const makeExecutionDecision = (context: DecisionContext): StructuredDecis
           ? "PLACE"
           : "HOLD";
 
-  const quantity = Number(
-    ((account.balance * (sizedRiskPerTradePct / 100)) / Math.max(candidate.currentPrice * 0.01, 1)).toFixed(3),
-  );
+  // Calculate MT5 lot size correctly:
+  // lotSize = riskAmount / (stopDistance × contractSize)
+  // where contractSize depends on asset class
+  const riskAmountUsd = account.balance * (sizedRiskPerTradePct / 100);
+  const stopDistance = Math.abs((candidate.proposedEntry ?? candidate.currentPrice) - candidate.stopLoss);
+
+  // Determine contract size per asset class
+  // Forex standard lot = 100,000 units of base currency
+  // Gold (XAUUSD) = 100 oz per lot
+  // Crypto (BTCUSD etc) = 1 coin per lot on most MT5 brokers
+  // Indices (US500 etc) = 1 point per lot
+  const sym = candidate.symbol.toUpperCase();
+  let contractSize: number;
+  if (sym.includes("BTC") || sym.includes("ETH") || sym.includes("SOL") || sym.includes("LTC")) {
+    contractSize = 1;           // Crypto: 1 lot = 1 coin
+  } else if (sym.includes("XAU") || sym.includes("GOLD")) {
+    contractSize = 100;         // Gold: 100 oz per lot
+  } else if (sym.includes("XAG") || sym.includes("SILVER")) {
+    contractSize = 5000;        // Silver: 5000 oz per lot
+  } else if (sym.includes("US30") || sym.includes("US500") || sym.includes("NAS") || sym.includes("DAX") || sym.includes("SPX")) {
+    contractSize = 1;           // Indices: 1 lot = 1 index unit
+  } else {
+    contractSize = 100_000;     // Standard forex lot
+  }
+
+  // Compute lot size, clamp to broker limits (0.01 min, 50 max)
+  const rawLots = stopDistance > 0
+    ? riskAmountUsd / (stopDistance * contractSize)
+    : riskAmountUsd / (candidate.currentPrice * contractSize * 0.01);
+
+  // Round to 2 decimal places (standard MT5 lot precision), clamp to safe range
+  const quantity = Number(Math.max(0.01, Math.min(50, rawLots)).toFixed(2));
 
   return {
     action,

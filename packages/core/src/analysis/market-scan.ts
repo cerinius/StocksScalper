@@ -127,6 +127,81 @@ const inferDirectionFromIndicators = (
     votes.push({ direction: "SHORT", weight: 0.5 * bearNews, reason: `${bearNews} bearish news item(s)` });
   }
 
+  // 11. EMA200 macro trend filter
+  if (ind.ema200 !== undefined && ind.ema200 > 0) {
+    const price = bars.at(-1)!.close;
+    if (price > ind.ema200 * 1.001) {
+      votes.push({ direction: "LONG", weight: 1.2, reason: `Price above EMA200 (${ind.ema200.toFixed(2)}) — macro uptrend` });
+    } else if (price < ind.ema200 * 0.999) {
+      votes.push({ direction: "SHORT", weight: 1.2, reason: `Price below EMA200 (${ind.ema200.toFixed(2)}) — macro downtrend` });
+    }
+  }
+
+  // 12. Volume Profile — POC / Value Area bias
+  if (ind.pocPrice !== undefined && ind.pocPrice > 0) {
+    const price = bars.at(-1)!.close;
+    if (price > ind.vahPrice!) {
+      votes.push({ direction: "LONG", weight: 0.9, reason: `Price above VAH (${ind.vahPrice!.toFixed(2)}) — bullish value area breakout` });
+    } else if (price < ind.valPrice!) {
+      votes.push({ direction: "SHORT", weight: 0.9, reason: `Price below VAL (${ind.valPrice!.toFixed(2)}) — bearish value area breakdown` });
+    } else if (price > ind.pocPrice) {
+      votes.push({ direction: "LONG", weight: 0.5, reason: `Price above POC (${ind.pocPrice.toFixed(2)})` });
+    } else {
+      votes.push({ direction: "SHORT", weight: 0.5, reason: `Price below POC (${ind.pocPrice.toFixed(2)})` });
+    }
+  }
+
+  // 13. Order Flow — cumulative delta direction
+  if (ind.cumulativeDelta !== undefined) {
+    if (ind.cumulativeDelta > 0 && ind.deltaDivergence !== -1) {
+      votes.push({ direction: "LONG", weight: 1.0, reason: `Positive cumulative delta (${ind.cumulativeDelta.toFixed(0)}) — buying pressure` });
+    } else if (ind.cumulativeDelta < 0 && ind.deltaDivergence !== -1) {
+      votes.push({ direction: "SHORT", weight: 1.0, reason: `Negative cumulative delta (${ind.cumulativeDelta.toFixed(0)}) — selling pressure` });
+    }
+  }
+
+  // 14. ICT — Fair Value Gap (price trading into a FVG = likely fill + continuation)
+  if (ind.fvgPresent && ind.inFVG) {
+    if (ind.fvgType === "bullish") {
+      votes.push({ direction: "LONG", weight: 1.3, reason: `Price inside bullish FVG [${ind.fvgBottom!.toFixed(2)}–${ind.fvgTop!.toFixed(2)}] — imbalance fill` });
+    } else if (ind.fvgType === "bearish") {
+      votes.push({ direction: "SHORT", weight: 1.3, reason: `Price inside bearish FVG [${ind.fvgBottom!.toFixed(2)}–${ind.fvgTop!.toFixed(2)}] — imbalance fill` });
+    }
+  } else if (ind.fvgPresent && !ind.inFVG) {
+    // FVG exists but price is approaching it — softer signal
+    const price = bars.at(-1)!.close;
+    if (ind.fvgType === "bullish" && price < ind.fvgMid!) {
+      votes.push({ direction: "LONG", weight: 0.7, reason: `Approaching bullish FVG (mid: ${ind.fvgMid!.toFixed(2)})` });
+    } else if (ind.fvgType === "bearish" && price > ind.fvgMid!) {
+      votes.push({ direction: "SHORT", weight: 0.7, reason: `Approaching bearish FVG (mid: ${ind.fvgMid!.toFixed(2)})` });
+    }
+  }
+
+  // 15. ICT — Liquidity Sweep (stop-hunt reversal — high-conviction counter-move)
+  if (ind.liquiditySweep) {
+    if (ind.liquiditySweepType === "low_sweep") {
+      // Swept lows = smart money accumulated → expect LONG reversal
+      votes.push({ direction: "LONG", weight: 1.6, reason: `Liquidity sweep of lows at ${ind.sweepLevel!.toFixed(2)} — smart-money reversal long` });
+    } else if (ind.liquiditySweepType === "high_sweep") {
+      // Swept highs = smart money distributed → expect SHORT reversal
+      votes.push({ direction: "SHORT", weight: 1.6, reason: `Liquidity sweep of highs at ${ind.sweepLevel!.toFixed(2)} — smart-money reversal short` });
+    }
+  }
+
+  // 16. ICT — Market Structure BOS / CHoCH
+  if (ind.bosPresent || ind.chochPresent) {
+    const msType = ind.marketStructureType ?? "none";
+    if (msType === "bullish_bos") {
+      votes.push({ direction: "LONG", weight: ind.bosPresent ? 1.8 : 1.5, reason: "Bullish BOS — structure continuation long" });
+    } else if (msType === "bearish_bos") {
+      votes.push({ direction: "SHORT", weight: ind.bosPresent ? 1.8 : 1.5, reason: "Bearish BOS — structure continuation short" });
+    } else if (msType === "bullish_choch") {
+      votes.push({ direction: "LONG", weight: 1.5, reason: "Bullish CHoCH — character change, potential reversal long" });
+    } else if (msType === "bearish_choch") {
+      votes.push({ direction: "SHORT", weight: 1.5, reason: "Bearish CHoCH — character change, potential reversal short" });
+    }
+  }
+
   // Tally
   let longWeight = 0;
   let shortWeight = 0;
@@ -150,6 +225,34 @@ const selectStrategy = (
   regime: ReturnType<typeof detectMarketRegime>,
 ): string => {
   const { preferredStrategy } = regime;
+
+  // ICT: Liquidity sweep → high-conviction reversal entry
+  if (ind.liquiditySweep) {
+    if (ind.liquiditySweepType === "low_sweep" && direction === "LONG")
+      return "ict_liquidity_sweep_long";
+    if (ind.liquiditySweepType === "high_sweep" && direction === "SHORT")
+      return "ict_liquidity_sweep_short";
+  }
+
+  // ICT: CHoCH → reversal at structure shift
+  if (ind.chochPresent) {
+    return direction === "LONG" ? "ict_choch_reversal_long" : "ict_choch_reversal_short";
+  }
+
+  // ICT: FVG fill entry (price inside imbalance zone)
+  if (ind.fvgPresent && ind.inFVG) {
+    return direction === "LONG" ? "ict_fvg_entry_long" : "ict_fvg_entry_short";
+  }
+
+  // ICT: BOS continuation
+  if (ind.bosPresent) {
+    return direction === "LONG" ? "ict_bos_continuation_long" : "ict_bos_continuation_short";
+  }
+
+  // ICT: OTE retracement entry
+  if (ind.inOTEZone) {
+    return direction === "LONG" ? "ict_ote_entry_long" : "ict_ote_entry_short";
+  }
 
   // Bollinger Band squeeze breakout
   if (ind.bbWidth !== undefined && ind.bbWidth < 0.02) {
@@ -231,6 +334,64 @@ const computeConfluenceScore = (
     if (direction === "LONG" && ind.stochRsiK > 40 && ind.stochRsiK < 80) score += 2;
     if (direction === "SHORT" && ind.stochRsiK < 60 && ind.stochRsiK > 20) score += 2;
   }
+
+  // Bonus: EMA200 macro trend alignment
+  if (ind.ema200 !== undefined && ind.ema200 > 0) {
+    const price = ind.vwap ?? ind.ema21; // use a mid-price proxy
+    if ((direction === "LONG" && price > ind.ema200) || (direction === "SHORT" && price < ind.ema200)) {
+      score += 3;
+    }
+  }
+
+  // Bonus: Volume Profile — price on correct side of POC
+  if (ind.pocPrice !== undefined && ind.pocPrice > 0) {
+    const price = ind.vwap ?? ind.ema21;
+    if ((direction === "LONG" && price > ind.pocPrice) || (direction === "SHORT" && price < ind.pocPrice)) {
+      score += 2;
+    }
+  }
+
+  // Bonus: Order Flow delta confirms direction + no divergence
+  if (ind.cumulativeDelta !== undefined && ind.deltaDivergence !== undefined) {
+    const deltaOk =
+      (direction === "LONG" && ind.cumulativeDelta > 0) ||
+      (direction === "SHORT" && ind.cumulativeDelta < 0);
+    if (deltaOk && ind.deltaDivergence === 1) score += 3;
+    else if (deltaOk) score += 1;
+    else if (ind.deltaDivergence === -1) score -= 2; // divergence penalty
+  }
+
+  // Bonus: ICT FVG price inside gap (imbalance fill)
+  if (ind.fvgPresent && ind.inFVG) {
+    if ((direction === "LONG" && ind.fvgType === "bullish") ||
+        (direction === "SHORT" && ind.fvgType === "bearish")) {
+      score += 4;
+    }
+  }
+
+  // Bonus: ICT Liquidity Sweep (contrarian — price swept past stops then reversed)
+  if (ind.liquiditySweep) {
+    if ((direction === "LONG" && ind.liquiditySweepType === "low_sweep") ||
+        (direction === "SHORT" && ind.liquiditySweepType === "high_sweep")) {
+      score += 5;
+    }
+  }
+
+  // Bonus: ICT Market Structure confirms
+  if (ind.bosPresent || ind.chochPresent) {
+    const msType = ind.marketStructureType ?? "none";
+    const bullishMS = msType === "bullish_bos" || msType === "bullish_choch";
+    const bearishMS = msType === "bearish_bos" || msType === "bearish_choch";
+    if ((direction === "LONG" && bullishMS) || (direction === "SHORT" && bearishMS)) {
+      score += ind.bosPresent ? 6 : 5; // BOS slightly stronger than CHoCH
+    }
+  }
+
+  // Bonus: In ICT Killzone (high-probability time window)
+  if (ind.inKillzone) score += 3;
+
+  // Bonus: OTE Fibonacci retracement zone
+  if (ind.inOTEZone) score += 2;
 
   return clamp(score, 0, 100);
 };
@@ -382,6 +543,19 @@ export const analyzeMarketCandidate = (
       stochRsiK: ind.stochRsiK ?? 50,
       obvTrend: ind.obvTrend ?? 0,
       macdHistogram: ind.macdHistogram ?? 0,
+      // Volume Profile
+      priceRelToPoc: ind.priceRelToPoc ?? 0,
+      // Order Flow
+      cumulativeDelta: ind.cumulativeDelta ?? 0,
+      deltaDivergence: ind.deltaDivergence ?? 0,
+      // ICT
+      fvgPresent: ind.fvgPresent ? 1 : 0,
+      inFVG: ind.inFVG ? 1 : 0,
+      liquiditySweep: ind.liquiditySweep ? 1 : 0,
+      bosPresent: ind.bosPresent ? 1 : 0,
+      chochPresent: ind.chochPresent ? 1 : 0,
+      inOTEZone: ind.inOTEZone ? 1 : 0,
+      inKillzone: ind.inKillzone ? 1 : 0,
     },
     indicatorSnapshot: ind,
     reasoningLog: buildReasoningLog([
@@ -399,15 +573,27 @@ export const analyzeMarketCandidate = (
       },
       {
         title: "Technical confluence",
-        detail: `RSI ${ind.rsi14.toFixed(1)} | MACD ${ind.macd.toFixed(4)} (hist ${(ind.macdHistogram ?? 0).toFixed(4)}) | ADX ${(ind.adx14 ?? 0).toFixed(1)} | BB%B ${((ind.bbPercentB ?? 0.5) * 100).toFixed(0)}% | StochRSI K=${(ind.stochRsiK ?? 50).toFixed(0)}`,
+        detail: `RSI ${ind.rsi14.toFixed(1)} | MACD ${ind.macd.toFixed(4)} (hist ${(ind.macdHistogram ?? 0).toFixed(4)}) | ADX ${(ind.adx14 ?? 0).toFixed(1)} | BB%B ${((ind.bbPercentB ?? 0.5) * 100).toFixed(0)}% | StochRSI K=${(ind.stochRsiK ?? 50).toFixed(0)} | EMA200 ${(ind.ema200 ?? 0).toFixed(2)}`,
         weight: 0.80,
-        tags: ["technical", "rsi", "macd", "adx", "bollinger"],
+        tags: ["technical", "rsi", "macd", "adx", "bollinger", "ema200"],
       },
       {
-        title: "Volume & OBV",
-        detail: `Relative volume ${ind.volumeRatio.toFixed(2)}x | OBV trend ${(ind.obvTrend ?? 0).toFixed(1)} (${(ind.obvTrend ?? 0) > 0 ? "accumulation" : "distribution"})`,
-        weight: 0.62,
-        tags: ["volume", "obv"],
+        title: "Volume Profile & Order Flow",
+        detail: `POC: ${(ind.pocPrice ?? 0).toFixed(2)} | VAH: ${(ind.vahPrice ?? 0).toFixed(2)} | VAL: ${(ind.valPrice ?? 0).toFixed(2)} | Price rel POC: ${(ind.priceRelToPoc ?? 0).toFixed(2)}% | Cum delta: ${(ind.cumulativeDelta ?? 0).toFixed(0)} (${ind.deltaDivergence === -1 ? "DIVERGING ⚠" : "confirming"}) | Vol ${ind.volumeRatio.toFixed(2)}x | OBV trend ${(ind.obvTrend ?? 0).toFixed(1)}`,
+        weight: 0.75,
+        tags: ["volume", "obv", "volume_profile", "order_flow", "delta"],
+      },
+      {
+        title: "ICT structure",
+        detail: [
+          ind.fvgPresent ? `FVG ${ind.fvgType} [${(ind.fvgBottom ?? 0).toFixed(2)}–${(ind.fvgTop ?? 0).toFixed(2)}]${ind.inFVG ? " ✓ price inside" : ""}` : null,
+          ind.liquiditySweep ? `Liq sweep ${ind.liquiditySweepType} @ ${(ind.sweepLevel ?? 0).toFixed(2)}` : null,
+          (ind.bosPresent || ind.chochPresent) ? `Market structure: ${ind.marketStructureType}` : null,
+          ind.inOTEZone ? "In OTE zone (61.8–78.6% retrace)" : null,
+          ind.inKillzone ? `ICT killzone: ${ind.killzoneName}` : null,
+        ].filter(Boolean).join(" | ") || "No ICT structure signals",
+        weight: (ind.fvgPresent || ind.liquiditySweep || ind.bosPresent || ind.chochPresent) ? 0.85 : 0.30,
+        tags: ["ict", "fvg", "liquidity_sweep", "market_structure", "ote", "killzone"],
       },
       {
         title: "News context",

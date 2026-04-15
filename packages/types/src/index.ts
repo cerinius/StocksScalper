@@ -113,6 +113,38 @@ export interface MarketIndicatorSnapshot {
   minusDI?: number;
   williamsR?: number;
   cci20?: number;
+  // Extended moving averages
+  ema9?: number;        // Fast EMA for entry timing
+  ema200?: number;      // Major trend filter
+  // Volume Profile
+  pocPrice?: number;    // Point of Control (price with most traded volume)
+  vahPrice?: number;    // Value Area High (top of 70% volume zone)
+  valPrice?: number;    // Value Area Low (bottom of 70% volume zone)
+  priceRelToPoc?: number; // (close - POC) / POC * 100 — positive = above POC
+  // Order Flow (approximated from OHLCV)
+  orderFlowDelta?: number;       // Current bar: estimated buy vol − sell vol
+  cumulativeDelta?: number;      // Cumulative delta over last N bars
+  deltaDivergence?: number;      // +1 = delta confirms price, −1 = divergence
+  // ICT — Fair Value Gap
+  fvgPresent?: boolean;          // A recent FVG exists
+  fvgType?: "bullish" | "bearish" | "none"; // Gap direction
+  fvgTop?: number;               // Top of the gap range
+  fvgBottom?: number;            // Bottom of the gap range
+  fvgMid?: number;               // Midpoint of the gap
+  inFVG?: boolean;               // Current price is inside the gap
+  // ICT — Liquidity Sweep
+  liquiditySweep?: boolean;      // Last bar swept a prior high/low and reversed
+  liquiditySweepType?: "high_sweep" | "low_sweep" | "none";
+  sweepLevel?: number;           // The swept price level
+  // ICT — Market Structure
+  bosPresent?: boolean;          // Break of Structure detected
+  chochPresent?: boolean;        // Change of Character detected
+  marketStructureType?: "bullish_bos" | "bearish_bos" | "bullish_choch" | "bearish_choch" | "none";
+  // ICT — Optimal Trade Entry (Fibonacci 61.8–78.6% retracement)
+  inOTEZone?: boolean;
+  // ICT — Session Killzones
+  inKillzone?: boolean;
+  killzoneName?: string;         // "London Open" | "New York Open" | "London Close" | "Asian"
 }
 
 export interface NewsIntelligenceRecord {

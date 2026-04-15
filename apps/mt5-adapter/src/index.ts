@@ -229,7 +229,34 @@ app.get<{ Params: { symbol: string } }>("/quote/:symbol", async (request, reply)
 
 app.post("/orders", async (request, reply) => {
   if (useLiveBridge) {
-    const result = await proxyToBridge("/orders/market", "POST", request.body);
+    // Translate from internal schema → Python bridge MarketOrderRequest schema
+    // Internal: { symbol, direction: "LONG"|"SHORT", quantity, entry, stopLoss, takeProfit, decisionId }
+    // Bridge:   { symbol, side: "buy"|"sell", volume, sl, tp, comment }
+    const payload = mt5OrderRequestSchema.parse(request.body);
+    const bridgeBody = {
+      symbol: payload.symbol,
+      side: payload.direction === "LONG" ? "buy" : "sell",
+      volume: payload.quantity,
+      sl: payload.stopLoss,
+      tp: payload.takeProfit,
+      comment: `scalper-${payload.decisionId.slice(0, 8)}`,
+    };
+    const result = await proxyToBridge("/orders", "POST", bridgeBody);
+    if (result.status === 200 || result.status === 201) {
+      // Normalise bridge response to our order shape
+      const r = result.data as { ticket?: number; price?: number; volume?: number; retcode?: number; comment?: string };
+      return reply.status(200).send({
+        orderId: `mt5-${r.ticket ?? Date.now()}`,
+        brokerOrderId: String(r.ticket ?? ""),
+        status: "FILLED",
+        symbol: payload.symbol,
+        direction: payload.direction,
+        quantity: r.volume ?? payload.quantity,
+        entry: r.price ?? payload.entry,
+        decisionId: payload.decisionId,
+        createdAt: new Date().toISOString(),
+      });
+    }
     return reply.status(result.status).send(result.data);
   }
   if (!state.connected) {
@@ -274,9 +301,13 @@ app.post("/orders", async (request, reply) => {
 
 app.post<{ Params: { positionId: string } }>("/positions/:positionId/close", async (request, reply) => {
   if (useLiveBridge) {
+    // Bridge route: POST /positions/{ticket}/close (ticket is the MT5 position ticket integer)
     const { positionId } = request.params;
-    const body = { position_ticket: Number(positionId) };
-    const result = await proxyToBridge("/orders/close", "POST", body);
+    const ticket = Number(positionId);
+    if (isNaN(ticket)) {
+      return reply.status(400).send({ error: `Invalid positionId (expected numeric MT5 ticket): ${positionId}` });
+    }
+    const result = await proxyToBridge(`/positions/${ticket}/close`, "POST");
     return reply.status(result.status).send(result.data);
   }
 

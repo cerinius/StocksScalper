@@ -344,6 +344,279 @@ const cci = (bars: PriceBar[], period = 20): number => {
   return (latest - mean) / (0.015 * meanDeviation);
 };
 
+// ─── Volume Profile ───────────────────────────────────────────────────────────
+
+interface VolumeProfileResult {
+  poc: number;           // Point of Control
+  vah: number;           // Value Area High (70% of volume above POC)
+  val: number;           // Value Area Low  (70% of volume below POC)
+  priceRelToPoc: number; // (close - poc) / poc × 100; positive = above
+}
+
+const volumeProfile = (bars: PriceBar[], lookback = 50, numBuckets = 30): VolumeProfileResult => {
+  const zero: VolumeProfileResult = { poc: 0, vah: 0, val: 0, priceRelToPoc: 0 };
+  if (bars.length < 2) return zero;
+
+  const slice = bars.slice(-lookback);
+  const priceMax = Math.max(...slice.map((b) => b.high));
+  const priceMin = Math.min(...slice.map((b) => b.low));
+  if (priceMax === priceMin) return { poc: priceMax, vah: priceMax, val: priceMin, priceRelToPoc: 0 };
+
+  const bucketSize = (priceMax - priceMin) / numBuckets;
+  const buckets = new Array<number>(numBuckets).fill(0);
+
+  for (const bar of slice) {
+    const barRange = bar.high - bar.low;
+    for (let i = 0; i < numBuckets; i++) {
+      const bucketLow = priceMin + i * bucketSize;
+      const bucketHigh = bucketLow + bucketSize;
+      const overlap = Math.max(0, Math.min(bar.high, bucketHigh) - Math.max(bar.low, bucketLow));
+      if (overlap > 0 && barRange > 0) buckets[i] += bar.volume * (overlap / barRange);
+    }
+  }
+
+  // POC = bucket with highest volume
+  let pocIdx = 0;
+  for (let i = 1; i < numBuckets; i++) {
+    if (buckets[i] > buckets[pocIdx]) pocIdx = i;
+  }
+  const poc = priceMin + (pocIdx + 0.5) * bucketSize;
+
+  // Value Area: expand from POC until 70% of total volume is covered
+  const totalVol = buckets.reduce((a, b) => a + b, 0);
+  const target = totalVol * 0.70;
+  let vaVol = buckets[pocIdx];
+  let vaLow = pocIdx;
+  let vaHigh = pocIdx;
+
+  while (vaVol < target) {
+    const upNext = vaHigh + 1 < numBuckets ? buckets[vaHigh + 1] : -1;
+    const dnNext = vaLow - 1 >= 0 ? buckets[vaLow - 1] : -1;
+    if (upNext < 0 && dnNext < 0) break;
+    if (upNext >= dnNext) { vaHigh++; vaVol += buckets[vaHigh]; }
+    else { vaLow--; vaVol += buckets[vaLow]; }
+  }
+
+  const val = priceMin + vaLow * bucketSize;
+  const vah = priceMin + (vaHigh + 1) * bucketSize;
+  const latestClose = slice.at(-1)!.close;
+  const priceRelToPoc = poc === 0 ? 0 : ((latestClose - poc) / poc) * 100;
+
+  return { poc, vah, val, priceRelToPoc };
+};
+
+// ─── Order Flow Delta (OHLCV approximation) ───────────────────────────────────
+
+interface OrderFlowResult {
+  delta: number;           // Latest bar: estimated buy − sell volume
+  cumulativeDelta: number; // Sum of delta over lookback bars
+  deltaDivergence: number; // +1 = delta confirms price direction, −1 = divergence
+}
+
+const orderFlowDelta = (bars: PriceBar[], lookback = 20): OrderFlowResult => {
+  const zero: OrderFlowResult = { delta: 0, cumulativeDelta: 0, deltaDivergence: 0 };
+  if (bars.length < 2) return zero;
+
+  const slice = bars.slice(-lookback);
+  const deltas: number[] = [];
+
+  for (const bar of slice) {
+    const range = bar.high - bar.low;
+    if (range === 0) { deltas.push(0); continue; }
+    // Buying pressure ∝ (close − low); selling pressure ∝ (high − close)
+    const buyVol = bar.volume * ((bar.close - bar.low) / range);
+    const sellVol = bar.volume * ((bar.high - bar.close) / range);
+    deltas.push(buyVol - sellVol);
+  }
+
+  const currentDelta = deltas.at(-1) ?? 0;
+  const cumulativeDelta = deltas.reduce((a, b) => a + b, 0);
+
+  // Divergence: does cumulative delta agree with 5-bar price direction?
+  const recent5bars = slice.slice(-5);
+  const recent5deltas = deltas.slice(-5);
+  if (recent5bars.length >= 2) {
+    const priceDir = recent5bars.at(-1)!.close > recent5bars[0].close ? 1 : -1;
+    const deltaDir = recent5deltas.reduce((a, b) => a + b, 0) >= 0 ? 1 : -1;
+    const deltaDivergence = priceDir === deltaDir ? 1 : -1;
+    return { delta: currentDelta, cumulativeDelta, deltaDivergence };
+  }
+
+  return { delta: currentDelta, cumulativeDelta, deltaDivergence: 0 };
+};
+
+// ─── ICT: Fair Value Gap ──────────────────────────────────────────────────────
+
+interface FVGResult {
+  present: boolean;
+  type: "bullish" | "bearish" | "none";
+  top: number;
+  bottom: number;
+  mid: number;
+  inFVG: boolean;
+}
+
+/**
+ * Fair Value Gap — 3-candle imbalance:
+ *   Bullish FVG: candle[i−2].high < candle[i].low  (price jumped up leaving a gap)
+ *   Bearish FVG: candle[i−2].low  > candle[i].high (price dropped leaving a gap)
+ * Returns the most recent unmitigated FVG within `lookback` bars.
+ */
+const detectFVG = (bars: PriceBar[], lookback = 15): FVGResult => {
+  const zero: FVGResult = { present: false, type: "none", top: 0, bottom: 0, mid: 0, inFVG: false };
+  if (bars.length < 3) return zero;
+
+  const current = bars.at(-1)!;
+  const slice = bars.slice(-lookback);
+
+  for (let i = slice.length - 1; i >= 2; i--) {
+    const b1 = slice[i - 2];
+    const b3 = slice[i];
+
+    if (b3.low > b1.high) {
+      // Bullish FVG
+      const bottom = b1.high;
+      const top = b3.low;
+      const mid = (top + bottom) / 2;
+      const inFVG = current.close >= bottom && current.close <= top;
+      return { present: true, type: "bullish", top, bottom, mid, inFVG };
+    }
+    if (b3.high < b1.low) {
+      // Bearish FVG
+      const top = b1.low;
+      const bottom = b3.high;
+      const mid = (top + bottom) / 2;
+      const inFVG = current.close >= bottom && current.close <= top;
+      return { present: true, type: "bearish", top, bottom, mid, inFVG };
+    }
+  }
+
+  return zero;
+};
+
+// ─── ICT: Liquidity Sweep ─────────────────────────────────────────────────────
+
+interface LiquiditySweepResult {
+  present: boolean;
+  type: "high_sweep" | "low_sweep" | "none";
+  sweepLevel: number;
+}
+
+/**
+ * Liquidity Sweep — the last candle briefly broke a prior swing high/low
+ * (triggering stops) but closed back inside the range (smart-money reversal).
+ */
+const detectLiquiditySweep = (bars: PriceBar[], lookback = 20): LiquiditySweepResult => {
+  const zero: LiquiditySweepResult = { present: false, type: "none", sweepLevel: 0 };
+  if (bars.length < lookback + 2) return zero;
+
+  const recent = bars.at(-1)!;
+  const swingBars = bars.slice(-(lookback + 1), -1);
+  const swingHigh = Math.max(...swingBars.map((b) => b.high));
+  const swingLow = Math.min(...swingBars.map((b) => b.low));
+
+  // High sweep: wick exceeded prior high but closed below it
+  if (recent.high > swingHigh && recent.close < swingHigh) {
+    return { present: true, type: "high_sweep", sweepLevel: swingHigh };
+  }
+  // Low sweep: wick exceeded prior low but closed above it
+  if (recent.low < swingLow && recent.close > swingLow) {
+    return { present: true, type: "low_sweep", sweepLevel: swingLow };
+  }
+
+  return zero;
+};
+
+// ─── ICT: Market Structure (BOS / CHoCH) ─────────────────────────────────────
+
+interface MarketStructureResult {
+  bosPresent: boolean;
+  chochPresent: boolean;
+  type: "bullish_bos" | "bearish_bos" | "bullish_choch" | "bearish_choch" | "none";
+}
+
+/**
+ * Break of Structure (BOS) = trend continuation past prior swing.
+ * Change of Character (CHoCH) = first break in the opposite direction — reversal signal.
+ */
+const detectMarketStructure = (bars: PriceBar[], swingLen = 5): MarketStructureResult => {
+  const zero: MarketStructureResult = { bosPresent: false, chochPresent: false, type: "none" };
+  const needed = swingLen * 4;
+  if (bars.length < needed) return zero;
+
+  const recent = bars.slice(-needed);
+  const current = recent.at(-1)!;
+
+  // Collect swing highs and lows (simple pivot detection)
+  const swingHighs: number[] = [];
+  const swingLows: number[] = [];
+
+  for (let i = swingLen; i < recent.length - swingLen; i++) {
+    const window = recent.slice(i - swingLen, i + swingLen + 1);
+    if (recent[i].high >= Math.max(...window.map((b) => b.high))) swingHighs.push(recent[i].high);
+    if (recent[i].low <= Math.min(...window.map((b) => b.low))) swingLows.push(recent[i].low);
+  }
+
+  if (swingHighs.length < 2 || swingLows.length < 2) return zero;
+
+  const lastHigh = swingHighs.at(-1)!;
+  const prevHigh = swingHighs.at(-2)!;
+  const lastLow = swingLows.at(-1)!;
+  const prevLow = swingLows.at(-2)!;
+
+  // Bullish break
+  if (current.close > lastHigh) {
+    // Higher prior swings = uptrend continuation (BOS); else first break up = CHoCH
+    return prevHigh < lastHigh
+      ? { bosPresent: true, chochPresent: false, type: "bullish_bos" }
+      : { bosPresent: false, chochPresent: true, type: "bullish_choch" };
+  }
+  // Bearish break
+  if (current.close < lastLow) {
+    return prevLow > lastLow
+      ? { bosPresent: true, chochPresent: false, type: "bearish_bos" }
+      : { bosPresent: false, chochPresent: true, type: "bearish_choch" };
+  }
+
+  return zero;
+};
+
+// ─── ICT: Optimal Trade Entry (Fibonacci 61.8–78.6% retracement) ─────────────
+
+/**
+ * Returns true when the current close sits in the OTE zone — the
+ * 61.8 %–78.6 % retracement of the most recent impulse swing.
+ */
+const detectOTEZone = (bars: PriceBar[], swingLookback = 20): boolean => {
+  if (bars.length < swingLookback + 1) return false;
+
+  const slice = bars.slice(-swingLookback);
+  const current = bars.at(-1)!;
+  const swingHigh = Math.max(...slice.map((b) => b.high));
+  const swingLow = Math.min(...slice.map((b) => b.low));
+  const range = swingHigh - swingLow;
+  if (range === 0) return false;
+
+  // Bullish OTE: price retracted 61.8–78.6% from swing high back toward low
+  const ote618 = swingHigh - range * 0.618;
+  const ote786 = swingHigh - range * 0.786;
+  return current.close >= ote786 && current.close <= ote618;
+};
+
+// ─── ICT: Session Killzones ───────────────────────────────────────────────────
+
+const checkKillzone = (): { inKillzone: boolean; name: string } => {
+  const now = new Date();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+
+  if (mins >= 420 && mins < 600) return { inKillzone: true, name: "London Open" };   // 07–10 UTC
+  if (mins >= 720 && mins < 900) return { inKillzone: true, name: "New York Open" }; // 12–15 UTC
+  if (mins >= 900 && mins < 1020) return { inKillzone: true, name: "London Close" }; // 15–17 UTC
+  if (mins >= 1380 || mins < 120) return { inKillzone: true, name: "Asian" };         // 23–02 UTC
+
+  return { inKillzone: false, name: "" };
+};
+
 // ─── Full Snapshot ────────────────────────────────────────────────────────────
 
 export const calculateIndicatorSnapshot = (bars: PriceBar[]): MarketIndicatorSnapshot => {
@@ -380,6 +653,10 @@ export const calculateIndicatorSnapshot = (bars: PriceBar[]): MarketIndicatorSna
   const baselineVol = average(bars.slice(-20).map((b) => b.volume)) || recentVol || 1;
   const volumeRatio = recentVol / baselineVol;
 
+  // Extended MAs
+  const ema9 = ema(closes, 9);
+  const ema200 = closes.length >= 200 ? ema(closes, 200) : ema(closes, closes.length);
+
   // Trend & momentum
   const trendStrength = clamp(((ema21 - ema50) / Math.max(latest.close, 1)) * 1000, -100, 100);
   const momentumScore = clamp(
@@ -397,6 +674,19 @@ export const calculateIndicatorSnapshot = (bars: PriceBar[]): MarketIndicatorSna
   const wR = williamsR(bars, 14);
   const cciValue = cci(bars, 20);
 
+  // ── Volume Profile ───────────────────────────────────────────────────────────
+  const vp = volumeProfile(bars, Math.min(bars.length, 50));
+
+  // ── Order Flow ───────────────────────────────────────────────────────────────
+  const of_ = orderFlowDelta(bars, Math.min(bars.length, 20));
+
+  // ── ICT Layers ───────────────────────────────────────────────────────────────
+  const fvg = detectFVG(bars, Math.min(bars.length, 15));
+  const liqSweep = detectLiquiditySweep(bars, Math.min(bars.length - 2, 20));
+  const ms = detectMarketStructure(bars);
+  const inOTEZone = detectOTEZone(bars, Math.min(bars.length - 1, 20));
+  const kz = checkKillzone();
+
   return {
     // Core
     sma20,
@@ -412,6 +702,9 @@ export const calculateIndicatorSnapshot = (bars: PriceBar[]): MarketIndicatorSna
     volumeRatio,
     trendStrength,
     momentumScore,
+    // Extended MAs
+    ema9,
+    ema200,
     // Bollinger Bands
     bbUpper: bb.upper,
     bbMiddle: bb.middle,
@@ -434,5 +727,34 @@ export const calculateIndicatorSnapshot = (bars: PriceBar[]): MarketIndicatorSna
     williamsR: wR,
     // CCI
     cci20: cciValue,
+    // Volume Profile
+    pocPrice: vp.poc,
+    vahPrice: vp.vah,
+    valPrice: vp.val,
+    priceRelToPoc: vp.priceRelToPoc,
+    // Order Flow
+    orderFlowDelta: of_.delta,
+    cumulativeDelta: of_.cumulativeDelta,
+    deltaDivergence: of_.deltaDivergence,
+    // ICT — FVG
+    fvgPresent: fvg.present,
+    fvgType: fvg.type,
+    fvgTop: fvg.top,
+    fvgBottom: fvg.bottom,
+    fvgMid: fvg.mid,
+    inFVG: fvg.inFVG,
+    // ICT — Liquidity Sweep
+    liquiditySweep: liqSweep.present,
+    liquiditySweepType: liqSweep.type,
+    sweepLevel: liqSweep.sweepLevel,
+    // ICT — Market Structure
+    bosPresent: ms.bosPresent,
+    chochPresent: ms.chochPresent,
+    marketStructureType: ms.type,
+    // ICT — OTE
+    inOTEZone,
+    // ICT — Killzones
+    inKillzone: kz.inKillzone,
+    killzoneName: kz.name,
   };
 };
