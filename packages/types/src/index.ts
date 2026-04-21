@@ -217,6 +217,28 @@ export interface StructuredDecision {
   evidenceSummary: string;
   reasons: ReasoningEntry[];
   blockingReasons: ReasoningEntry[];
+  /**
+   * Richer, machine-readable counterpart to {@link reasons}.
+   *
+   * Each entry carries a stable code, severity, observed vs expected values,
+   * and a user-facing flag so the UI can render it without hand-parsing
+   * free-text strings. Optional for backwards compatibility: legacy callers
+   * that only care about the flat string reasons continue to work.
+   */
+  structuredReasons?: Array<{
+    code: string;
+    category: string;
+    severity: "info" | "notice" | "warning" | "critical";
+    title: string;
+    explanation: string;
+    observed?: Record<string, number | string | boolean | null>;
+    expected?: Record<string, number | string | boolean | null>;
+    remediation?: string;
+    userFacing: boolean;
+    tags: string[];
+    at: string;
+  }>;
+  structuredBlockingReasons?: StructuredDecision["structuredReasons"];
   supportingReferences: SupportingReference[];
   executionParameters: {
     symbol: string;

@@ -4,7 +4,7 @@ import { Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
 import { createPlatformWorker, queueNames, queueNotification } from "@stock-radar/queues";
-import { stableHash } from "@stock-radar/shared";
+import { stableHash, DECISION_CODES, buildDecisionRecord } from "@stock-radar/shared";
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-execution");
@@ -500,19 +500,78 @@ const evaluateExecution = async (candidateId?: string) => {
         });
       }
 
+      const outcomeCode =
+        decision.action === "PLACE"
+          ? DECISION_CODES.EXECUTION_ENTERED
+          : decision.action === "INVALIDATE"
+            ? DECISION_CODES.EXECUTION_INVALIDATED
+            : decision.action === "SKIP"
+              ? DECISION_CODES.EXECUTION_SKIPPED
+              : config.trading.manualApprovalMode
+                ? DECISION_CODES.EXECUTION_MANUAL_APPROVAL
+                : DECISION_CODES.EXECUTION_HELD;
+
+      const outcomeRecord = buildDecisionRecord(outcomeCode, {
+        symbol: candidate.symbol.ticker,
+        strategy: candidate.strategyType,
+        timeframe: candidate.timeframe,
+        confidence: decision.confidence,
+        riskScore: decision.riskScore,
+        observed: {
+          action: decision.action,
+          evidenceSummary: decision.evidenceSummary,
+          blockingReasonCount: decision.blockingReasons.length,
+        },
+        parentIdeaId: candidate.id,
+        parentValidationId: latestValidation?.id,
+        parentExecutionId: decisionRecord.id,
+      });
+
       await prisma.auditLog.create({
         data: {
           actorType: "WORKER",
           actorId: "worker-execution",
           workerType: "EXECUTION",
-          severity: decision.action === "PLACE" ? "INFO" : "WARNING",
-          category: "worker.execution",
-          message: `Execution decision ${decision.action} created for ${candidate.symbol.ticker}.`,
+          severity: decision.action === "PLACE" ? "INFO" : decision.action === "INVALIDATE" ? "WARNING" : "INFO",
+          category: "execution",
+          message: outcomeRecord.title,
           entityType: "execution_decision",
           entityId: decisionRecord.id,
           symbolId: candidate.symbolId,
+          data: asJson({
+            structured: outcomeRecord,
+            structuredBlockingReasons: decision.structuredBlockingReasons ?? [],
+            action: decision.action,
+            confidence: decision.confidence,
+            riskScore: decision.riskScore,
+          }),
         },
       });
+
+      // Write one dedicated audit row per blocking reason so reviewers can
+      // filter "why was this skipped" directly on the audit page without
+      // having to open the parent execution decision.
+      for (const structuredBlocker of decision.structuredBlockingReasons ?? []) {
+        await prisma.auditLog.create({
+          data: {
+            actorType: "WORKER",
+            actorId: "worker-execution",
+            workerType: "EXECUTION",
+            severity:
+              structuredBlocker.severity === "critical"
+                ? "CRITICAL"
+                : structuredBlocker.severity === "warning"
+                  ? "WARNING"
+                  : "INFO",
+            category: structuredBlocker.category,
+            message: structuredBlocker.title,
+            entityType: "execution_decision",
+            entityId: decisionRecord.id,
+            symbolId: candidate.symbolId,
+            data: asJson({ structured: structuredBlocker }),
+          },
+        });
+      }
     }
 
     await completeWorkerRun(run.id, `${placed} orders placed`, { placed });

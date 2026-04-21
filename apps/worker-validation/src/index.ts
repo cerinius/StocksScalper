@@ -19,6 +19,7 @@ import { Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
 import { createPlatformQueues, createPlatformWorker, queueNames } from "@stock-radar/queues";
+import { DECISION_CODES, buildDecisionRecord } from "@stock-radar/shared";
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-validation");
@@ -372,25 +373,82 @@ const processCandidate = async (candidateId?: string) => {
         data: { status: nextStatus },
       });
 
+      // Pick the most specific decision code for why validation passed/failed.
+      const passed = validationBundle.finalScore >= 60;
+      const validationCode = passed
+        ? DECISION_CODES.VALIDATION_PASSED
+        : validationBundle.metrics.historicalSampleSize < 8
+          ? DECISION_CODES.VALIDATION_FAILED_SAMPLE
+          : validationBundle.metrics.expectancy <= 0
+            ? DECISION_CODES.VALIDATION_FAILED_EXPECTANCY
+            : DECISION_CODES.VALIDATION_FAILED_SCORE;
+
+      const validationRecord = buildDecisionRecord(validationCode, {
+        symbol: candidate.symbol.ticker,
+        strategy: candidate.strategyType,
+        timeframe: candidate.timeframe,
+        confidence: validationBundle.metrics.confidenceScore,
+        observed: {
+          finalScore: Number(validationBundle.finalScore.toFixed(2)),
+          sampleSize: validationBundle.metrics.historicalSampleSize,
+          realAnalogCount,
+          expectancy: Number(validationBundle.metrics.expectancy.toFixed(3)),
+          winRate: Number(validationBundle.metrics.winRateEstimate.toFixed(3)),
+        },
+        expected: passed ? undefined : { finalScore: 60, sampleSize: 8, expectancy: 0 },
+        parentIdeaId: candidate.id,
+        parentValidationId: validationRun.id,
+      });
+
       await prisma.auditLog.create({
         data: {
           actorType: "WORKER",
           actorId: "worker-validation",
           workerType: "VALIDATION",
-          severity: validationBundle.finalScore >= 60 ? "INFO" : "WARNING",
-          category: "worker.validation",
-          message: `Validation ${validationBundle.finalScore >= 60 ? "passed" : "failed"} for ${candidate.symbol.ticker} (score ${validationBundle.finalScore.toFixed(1)}, ${realAnalogCount} real analogs).`,
+          severity: passed ? "INFO" : "WARNING",
+          category: "validation",
+          message: validationRecord.title,
           entityType: "validation_run",
           entityId: validationRun.id,
           symbolId: candidate.symbolId,
-          data: {
+          data: asJson({
+            structured: validationRecord,
             finalScore: validationBundle.finalScore,
             realAnalogCount,
             expectancy: validationBundle.metrics.expectancy,
             winRate: validationBundle.metrics.winRateEstimate,
-          },
+          }),
         },
       });
+
+      // If the analog engine fell back to synthetics because there was not
+      // enough real history, add an additional advisory audit row so the
+      // reviewer knows to treat the confidence as reduced.
+      if (realAnalogCount === 0) {
+        const fallbackRecord = buildDecisionRecord(DECISION_CODES.VALIDATION_SYNTHETIC_FALLBACK, {
+          symbol: candidate.symbol.ticker,
+          strategy: candidate.strategyType,
+          timeframe: candidate.timeframe,
+          observed: { realAnalogCount, sampleSize: validationBundle.metrics.historicalSampleSize },
+          expected: { realAnalogCount: 8 },
+          parentIdeaId: candidate.id,
+          parentValidationId: validationRun.id,
+        });
+        await prisma.auditLog.create({
+          data: {
+            actorType: "WORKER",
+            actorId: "worker-validation",
+            workerType: "VALIDATION",
+            severity: "WARNING",
+            category: "validation",
+            message: fallbackRecord.title,
+            entityType: "validation_run",
+            entityId: validationRun.id,
+            symbolId: candidate.symbolId,
+            data: asJson({ structured: fallbackRecord }),
+          },
+        });
+      }
 
       if (validationBundle.finalScore >= 60) {
         await queues.execution.add("validationCompleted", {

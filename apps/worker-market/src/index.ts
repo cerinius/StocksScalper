@@ -4,7 +4,7 @@ import { AssetClass, Prisma } from "@prisma/client";
 import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
 import { createPlatformQueues, createPlatformWorker, queueNames } from "@stock-radar/queues";
-import { stableHash } from "@stock-radar/shared";
+import { DECISION_CODES, buildDecisionRecord, stableHash } from "@stock-radar/shared";
 import type { NewsIntelligenceRecord, PriceBar, Timeframe } from "@stock-radar/types";
 import WebSocket from "ws";
 
@@ -229,6 +229,45 @@ const scanSymbolTimeframe = async (
     setupScore: candidate.setupScore.toFixed(1),
     candidateId: candidateRecord.id,
   });
+
+  // Write a structured audit entry so the idea is visible in the audit trail
+  // with the exact numbers that made it qualify. This makes "why did this
+  // idea appear?" a question the UI can answer without reading worker logs.
+  try {
+    const decision = buildDecisionRecord(DECISION_CODES.IDEA_CREATED, {
+      title: `Idea recorded for ${ticker} ${timeframe} (${candidate.direction})`,
+      symbol: ticker,
+      timeframe,
+      strategy: candidate.strategyType,
+      confidence: candidate.confidenceScore,
+      observed: {
+        setupScore: candidate.setupScore,
+        confidenceScore: candidate.confidenceScore,
+        riskReward: candidate.riskReward,
+      },
+      parentIdeaId: candidateRecord.id,
+      detail: candidate.reasoningLog?.[0]?.detail,
+    });
+    await prisma.auditLog.create({
+      data: {
+        actorType: "WORKER",
+        workerType: "MARKET",
+        severity: "INFO",
+        category: "candidate_created",
+        message: decision.title,
+        entityType: "TradeCandidate",
+        entityId: candidateRecord.id,
+        symbolId: dbSymbolId,
+        data: decision as unknown as Prisma.InputJsonValue,
+      },
+    });
+  } catch (error) {
+    // Never fail candidate creation over a failed audit write.
+    logger.warn("Failed to write audit entry for new candidate", {
+      candidateId: candidateRecord.id,
+      error: (error as Error).message,
+    });
+  }
 
   await queues.validation.add(
     "candidateFromMarket",
