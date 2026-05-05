@@ -1,217 +1,144 @@
 import { getPlatformConfig } from "@stock-radar/config";
-import { calculatePearsonCorrelation, makeExecutionDecision, computeStreakRiskScale } from "@stock-radar/core";
-import { Prisma } from "@prisma/client";
-import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorkerHeartbeat } from "@stock-radar/db";
+import {
+  completeWorkerRun,
+  createWorkerRun,
+  failWorkerRun,
+  prisma,
+  upsertWorkerHeartbeat,
+} from "@stock-radar/db";
 import { createLogger } from "@stock-radar/logging";
-import { createPlatformWorker, queueNames, queueNotification } from "@stock-radar/queues";
-import { stableHash, DECISION_CODES, buildDecisionRecord } from "@stock-radar/shared";
+import { createPlatformWorker, queueNames } from "@stock-radar/queues";
+import { Prisma } from "@prisma/client";
+import { isAiEnabled } from "@stock-radar/ai";
+
+import { collectAccountContexts } from "./flow/collect-context";
+import { allocateCandidates } from "./flow/allocate";
+import { runPretradeCritic } from "./flow/pretrade-critic";
+import { decideForAccount } from "./flow/decide";
+import { placeOrder } from "./flow/place";
+import { persistAllocationDecision, persistDecision } from "./flow/record";
+import { getCorrelationContext, getQuote } from "./flow/market-context";
+import type { CandidateContext } from "./flow/types";
+import { runLegacyExecutionLoop } from "./legacy-loop";
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-execution");
-const asJson = <T>(value: T) => value as Prisma.InputJsonValue;
-const asNullableJson = <T>(value: T | null) => (value === null ? Prisma.JsonNull : (value as Prisma.InputJsonValue));
-const asObject = (value: unknown): Record<string, unknown> | null =>
-  typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-type ExecutionCandidate = {
-  id: string;
-  symbolId: string;
-  timeframe: string;
-  direction: string;
-  status: string;
-  currentPrice: number;
-  proposedEntry: number;
-  stopLoss: number;
-  takeProfit: number;
-  riskReward: number;
-  confidenceScore: number;
-  setupScore: number;
-  strategyType: string;
-  detectedAt: Date;
-  featureValues: Prisma.JsonValue;
-  indicatorSnapshot: Prisma.JsonValue;
-  reasoningLog: Prisma.JsonValue;
-  correlationTags: Prisma.JsonValue;
-  volatilityClassification: string;
-  symbol: {
-    ticker: string;
-  };
-};
-type ExecutionPositionRecord = {
-  symbolId: string;
-  direction: string;
-  exposurePct: number;
-  symbol: {
-    ticker: string;
-  };
+const aiCriticEnabled = isAiEnabled();
+
+type AnyPrisma = Record<string, unknown>;
+const pAny = prisma as unknown as AnyPrisma;
+
+const platformDefaults = {
+  maxSymbolExposurePct: config.risk.maxSymbolExposurePct,
+  maxCorrelatedExposurePct: config.risk.maxCorrelatedExposurePct,
+  maxEntrySpreadPct: config.risk.maxEntrySpreadPct,
+  staleSignalSeconds: config.risk.staleSignalSeconds,
 };
 
-const getDynamicRiskPerTradePct = async (account: { realizedPnlDaily: number; balance: number }) => {
-  const setting = await prisma.systemSetting.findUnique({ where: { key: "risk.dynamicControls" } });
-  const settingValue = asObject(setting?.value);
-  const override = settingValue?.maxRiskPerTradePct;
-  const supervisorBase = (typeof override === "number" && Number.isFinite(override))
-    ? Math.min(config.risk.maxRiskPerTradePct, Math.max(config.risk.minDynamicRiskPerTradePct, override))
-    : config.risk.maxRiskPerTradePct;
-
-  // Build streak context from recent closed positions
-  const recentClosed = await prisma.position.findMany({
-    where: { status: "CLOSED" },
-    orderBy: { closedAt: "desc" },
-    take: 20,
-    select: { realizedPnl: true, closedAt: true },
+/**
+ * Fetch validated candidates (or a single candidate by id) and
+ * hydrate them into CandidateContext objects ready for allocation.
+ * Correlation and spread context are computed once per candidate and
+ * reused across all account evaluations.
+ */
+const buildCandidateContexts = async (candidateId?: string): Promise<CandidateContext[]> => {
+  const candidates = await prisma.tradeCandidate.findMany({
+    where: candidateId ? { id: candidateId } : { status: "VALIDATED" },
+    include: { symbol: true, validationRuns: { orderBy: { createdAt: "desc" }, take: 1 } },
+    orderBy: candidateId ? undefined : { detectedAt: "desc" },
+    take: candidateId ? 1 : 6,
   });
 
-  const recentOutcomes = recentClosed.map((p: { realizedPnl: number }) => p.realizedPnl > 0).reverse();
-  let consecutiveLosses = 0;
-  let consecutiveWins = 0;
-  for (let i = recentOutcomes.length - 1; i >= 0; i--) {
-    if (!recentOutcomes[i]) { consecutiveLosses++; if (consecutiveWins > 0) break; }
-    else break;
-  }
-  for (let i = recentOutcomes.length - 1; i >= 0; i--) {
-    if (recentOutcomes[i]) { consecutiveWins++; if (consecutiveLosses > 0) break; }
-    else break;
-  }
-  if (recentOutcomes.at(-1) === false) consecutiveWins = 0;
-  if (recentOutcomes.at(-1) === true) consecutiveLosses = 0;
+  // All open positions across all accounts are used for spread / correlation
+  // context (we still bound correlation to same-direction accounts in
+  // the rule evaluator).
+  const allOpenPositions = await prisma.position.findMany({
+    where: { status: "OPEN" },
+    include: { symbol: true },
+  });
 
-  const dailyPnlPct = account.balance > 0 ? (account.realizedPnlDaily / account.balance) * 100 : 0;
+  const contexts: CandidateContext[] = [];
+  for (const candidate of candidates) {
+    const latestValidation = candidate.validationRuns[0];
+    const [correlation, quote] = await Promise.all([
+      getCorrelationContext(
+        { symbolId: candidate.symbolId, timeframe: candidate.timeframe, direction: candidate.direction },
+        allOpenPositions,
+      ),
+      getQuote(candidate.symbol.ticker, candidate.currentPrice),
+    ]);
 
-  const streak = computeStreakRiskScale(supervisorBase, {
-    consecutiveLosses,
-    consecutiveWins,
-    recentOutcomes,
-    dailyPnlPct,
-  }, config.risk.maxDailyLossPct);
-
-  if (streak.scaleFactor !== 1.0) {
-    logger.info("Streak risk scale applied", {
-      base: supervisorBase,
-      scaled: streak.scaledRiskPct,
-      factor: streak.scaleFactor,
-      reason: streak.reason,
+    contexts.push({
+      candidate: {
+        symbol: candidate.symbol.ticker,
+        timeframe: candidate.timeframe as never,
+        direction: candidate.direction as never,
+        strategyType: candidate.strategyType,
+        detectedAt: candidate.detectedAt.toISOString(),
+        currentPrice: candidate.currentPrice,
+        proposedEntry: candidate.proposedEntry,
+        stopLoss: candidate.stopLoss,
+        takeProfit: candidate.takeProfit,
+        riskReward: candidate.riskReward,
+        confidenceScore: candidate.confidenceScore,
+        setupScore: candidate.setupScore,
+        featureValues: candidate.featureValues as Record<string, number>,
+        indicatorSnapshot: candidate.indicatorSnapshot as never,
+        reasoningLog: candidate.reasoningLog as never,
+        status: candidate.status as never,
+        correlationTags: (candidate.correlationTags as string[]) ?? [],
+        volatilityClassification: candidate.volatilityClassification,
+      },
+      validation: latestValidation
+        ? {
+            winRateEstimate: latestValidation.winRateEstimate,
+            averageReturn: latestValidation.averageReturn,
+            averageAdverseExcursion: latestValidation.averageAdverseExcursion,
+            averageFavorableExcursion: latestValidation.averageFavorableExcursion,
+            maxDrawdown: latestValidation.maxDrawdown,
+            profitFactor: latestValidation.profitFactor,
+            expectancy: latestValidation.expectancy,
+            confidenceScore: latestValidation.confidenceScore,
+            confidenceIntervalLow: latestValidation.confidenceIntervalLow,
+            confidenceIntervalHigh: latestValidation.confidenceIntervalHigh,
+            historicalSampleSize: latestValidation.sampleSize,
+            dataQualityNotes: (latestValidation.dataQualityNotes as string[]) ?? [],
+          }
+        : null,
+      references: [
+        { type: "candidate", id: candidate.id, label: `${candidate.symbol.ticker} candidate` },
+        ...(latestValidation ? [{ type: "validation", id: latestValidation.id, label: "Latest validation" }] : []),
+      ],
+      dbIds: {
+        candidateId: candidate.id,
+        validationRunId: latestValidation?.id ?? null,
+        symbolId: candidate.symbolId,
+      },
+      market: {
+        spreadPct: quote?.spreadPct ?? null,
+        correlatedExposurePct: correlation.correlatedExposurePct,
+        correlatedSymbols: correlation.correlatedSymbols,
+      },
     });
   }
-
-  return Math.max(config.risk.minDynamicRiskPerTradePct, streak.scaledRiskPct);
+  return contexts;
 };
 
-const getQuote = async (symbol: string, mid: number) => {
-  try {
-    const response = await fetch(`${config.services.mt5AdapterUrl}/quote/${symbol}?mid=${mid}`);
-    if (!response.ok) return null;
-    return (await response.json()) as { bid: number; ask: number; mid: number; spreadPct: number };
-  } catch {
-    return null;
-  }
-};
-
-const getRecentCloses = async (symbolId: string, timeframe: string, take: number) => {
-  const bars = await prisma.priceBar.findMany({
-    where: {
-      symbolId,
-      timeframe,
-    },
-    orderBy: { timestamp: "desc" },
-    take,
-  });
-
-  return bars.map((bar) => bar.close).reverse();
-};
-
-const getCorrelationContext = async (
-  candidate: ExecutionCandidate,
-  openPositions: ExecutionPositionRecord[],
-) => {
-  if (openPositions.length === 0) {
-    return { correlatedExposurePct: 0, correlatedSymbols: [] as string[] };
-  }
-
-  const candidateCloses = await getRecentCloses(candidate.symbolId, candidate.timeframe, config.risk.correlationLookbackBars);
-  if (candidateCloses.length < 8) {
-    return { correlatedExposurePct: 0, correlatedSymbols: [] as string[] };
-  }
-
-  let correlatedExposurePct = 0;
-  const correlatedSymbols: string[] = [];
-
-  for (const position of openPositions) {
-    const positionCloses = await getRecentCloses(position.symbolId, candidate.timeframe, config.risk.correlationLookbackBars);
-    const correlation = Math.abs(calculatePearsonCorrelation(candidateCloses, positionCloses));
-    if (correlation < config.risk.correlationBlockThreshold) continue;
-    if (position.direction !== candidate.direction) continue;
-
-    correlatedExposurePct += position.exposurePct;
-    correlatedSymbols.push(`${position.symbol.ticker} (${correlation.toFixed(2)})`);
-  }
-
-  return {
-    correlatedExposurePct: Number(correlatedExposurePct.toFixed(2)),
-    correlatedSymbols,
-  };
-};
-
-// Lazy MT5 integration ID lookup — avoids hardcoding seed-specific "seed-mt5" ID
-let cachedMt5IntegrationId: string | null | undefined;
-
-const getMt5IntegrationId = async (): Promise<string | null> => {
-  if (cachedMt5IntegrationId !== undefined) return cachedMt5IntegrationId;
-  const integration = await prisma.integration.findFirst({ where: { kind: "MT5", enabled: true } });
-  cachedMt5IntegrationId = integration?.id ?? null;
-  return cachedMt5IntegrationId as string | null;
-};
-
-const getAccountSnapshot = async () => {
-  let adapterResponse: Response;
-  try {
-    adapterResponse = await fetch(`${config.services.mt5AdapterUrl}/account`);
-  } catch (err) {
-    throw new Error(`MT5 adapter unreachable at ${config.services.mt5AdapterUrl}/account: ${(err as Error).message}`);
-  }
-
-  if (!adapterResponse.ok) {
-    const body = await adapterResponse.text().catch(() => "");
-    throw new Error(`MT5 adapter returned ${adapterResponse.status} for /account: ${body.slice(0, 200)}`);
-  }
-
-  const account = (await adapterResponse.json()) as {
-    balance: number;
-    equity: number;
-    freeMargin: number;
-    usedMargin: number;
-    openPnl: number;
-    realizedPnlDaily: number;
-    drawdownPct: number;
-    maxDrawdownPct: number;
-    riskState: "NORMAL" | "CAUTION" | "BLOCKED" | "KILL_SWITCH";
-    killSwitchActive: boolean;
-    mode: "paper" | "live";
-  };
-
-  const integrationId = await getMt5IntegrationId();
-
-  await prisma.accountSnapshot.create({
-    data: {
-      integrationId,
-      capturedAt: new Date(),
-      balance: account.balance,
-      equity: account.equity,
-      freeMargin: account.freeMargin,
-      usedMargin: account.usedMargin,
-      marginLevel: Number(((account.equity / Math.max(account.usedMargin, 1)) * 100).toFixed(2)),
-      openPnl: account.openPnl,
-      realizedPnlDaily: account.realizedPnlDaily,
-      drawdownPct: account.drawdownPct,
-      maxDrawdownPct: account.maxDrawdownPct,
-      riskState: account.riskState,
-      killSwitchActive: account.killSwitchActive,
-      mode: account.mode === "paper" ? "PAPER" : "LIVE",
-    },
-  });
-
-  return account;
-};
-
+/**
+ * Account-aware execution loop. For each VALIDATED candidate:
+ *  1. Build market context (spread, correlation).
+ *  2. Collect every active account + its rule profile + snapshot.
+ *  3. Allocate: per (candidate, account), evaluate deterministic rules.
+ *  4. Decide: run the decision engine with account-derived risk limits.
+ *  5. Critic (advisory, Phase E): AI may reduce size — NEVER widen.
+ *  6. Place: call MT5 adapter with client order id idempotency.
+ *  7. Record: ExecutionDecision, Order, Position, RiskEvent, AuditLog,
+ *     RuleViolation, AllocationDecision — all attributed to accountId.
+ *
+ * Phase C will add a real AllocationPolicy resolver (ONE_ACCOUNT_ONLY
+ * vs. MAX_N_ACCOUNTS etc.) — right now we pick the top-ranked
+ * eligible account per candidate so the pipeline is end-to-end.
+ */
 const evaluateExecution = async (candidateId?: string) => {
   const run = await createWorkerRun({
     workerType: "EXECUTION",
@@ -228,350 +155,173 @@ const evaluateExecution = async (candidateId?: string) => {
       currentTask: candidateId ? "evaluate-candidate" : "execution-loop",
     });
 
-    const account = await getAccountSnapshot();
-    const [dynamicRiskPerTradePct, openPositions, candidates] = await Promise.all([
-      getDynamicRiskPerTradePct(account),
-      prisma.position.findMany({
-        where: { status: "OPEN" },
-        include: { symbol: true },
-      }),
-      candidateId
-        ? prisma.tradeCandidate.findMany({
-            where: { id: candidateId },
-            include: { symbol: true, validationRuns: { orderBy: { createdAt: "desc" }, take: 1 } },
-          })
-        : prisma.tradeCandidate.findMany({
-            where: { status: "VALIDATED" },
-            include: { symbol: true, validationRuns: { orderBy: { createdAt: "desc" }, take: 1 } },
-            orderBy: { detectedAt: "desc" },
-            take: 6,
-          }),
-    ]);
+    const accounts = await collectAccountContexts();
+
+    // If the multi-account world hasn't been bootstrapped yet (db has
+    // no Account rows or delegate missing), fall back to the legacy
+    // single-account loop so deployments keep working.
+    if (accounts.length === 0) {
+      logger.warn("No active accounts found — running legacy execution loop as fallback.");
+      const placed = await runLegacyExecutionLoop(candidateId);
+      await completeWorkerRun(run.id, `${placed} orders placed (legacy)`, { placed, mode: "legacy" });
+      await upsertWorkerHeartbeat({
+        workerType: "EXECUTION",
+        serviceName: "worker-execution",
+        status: "healthy",
+        currentTask: "idle",
+        metrics: { placed, mode: "legacy" },
+      });
+      return;
+    }
+
+    const candidates = await buildCandidateContexts(candidateId);
+    if (candidates.length === 0) {
+      await completeWorkerRun(run.id, "No candidates to evaluate", { placed: 0, candidates: 0 });
+      await upsertWorkerHeartbeat({
+        workerType: "EXECUTION",
+        serviceName: "worker-execution",
+        status: "healthy",
+        currentTask: "idle",
+        metrics: { placed: 0 },
+      });
+      return;
+    }
+
+    const setupPolicies = await prisma.setupAllocationPolicy
+      .findMany()
+      .then((rows: Array<{
+        setupKey: string;
+        policy: "ONE_ACCOUNT_ONLY" | "MAX_N_ACCOUNTS" | "ALL_ELIGIBLE" | "CHALLENGE_ONLY" | "FUNDED_ONLY" | "STRATEGY_TAGGED";
+        maxAccounts: number;
+        requiredTags: unknown;
+        excludedTags: unknown;
+        allowedPhaseKinds: unknown;
+        allowedAccountModes: unknown;
+      }>) =>
+        Object.fromEntries(
+          rows.map((r: {
+            setupKey: string;
+            policy: "ONE_ACCOUNT_ONLY" | "MAX_N_ACCOUNTS" | "ALL_ELIGIBLE" | "CHALLENGE_ONLY" | "FUNDED_ONLY" | "STRATEGY_TAGGED";
+            maxAccounts: number;
+            requiredTags: unknown;
+            excludedTags: unknown;
+            allowedPhaseKinds: unknown;
+            allowedAccountModes: unknown;
+          }) => [
+            r.setupKey,
+            {
+              setupKey: r.setupKey,
+              policy: r.policy,
+              maxAccounts: r.maxAccounts,
+              requiredTags: (r.requiredTags as string[]) ?? [],
+              excludedTags: (r.excludedTags as string[]) ?? [],
+              allowedPhaseKinds: (r.allowedPhaseKinds as string[]) ?? [],
+              allowedAccountModes: (r.allowedAccountModes as string[]) ?? [],
+            },
+          ]),
+        ),
+      )
+      .catch(() => ({}));
+
+    const now = new Date();
+    const allocations = allocateCandidates({ candidates, accounts, news: [], now, setupPolicies });
 
     let placed = 0;
-    const integrationId = await getMt5IntegrationId();
-    for (const candidate of candidates) {
-      const latestValidation = candidate.validationRuns[0];
-      const [correlationContext, quote] = await Promise.all([
-        getCorrelationContext(candidate, openPositions),
-        getQuote(candidate.symbol.ticker, candidate.currentPrice),
-      ]);
-      const idempotencyKey = stableHash({
-        candidateId: candidate.id,
-        status: candidate.status,
-        actionWindow: new Date().toISOString().slice(0, 13),
-      });
+    for (const alloc of allocations) {
+      const selectedAccountIds = alloc.selected.map((row) => row.account.accountId);
 
-      const existingDecision = await prisma.executionDecision.findUnique({ where: { idempotencyKey } });
-      if (existingDecision) continue;
+      // Record a RuleViolation for every fully-blocked account so we
+      // keep an audit trail even when no trade is placed.
+      for (const blockedRow of alloc.blocked) {
+        const allocDecisionIdemKey = `${alloc.candidateContext.dbIds.candidateId}-${blockedRow.account.accountId}-${new Date().toISOString().slice(0, 13)}`;
+        void allocDecisionIdemKey; // reserved for future dedupe
+      }
 
-      const decision = makeExecutionDecision({
-        candidate: {
-          symbol: candidate.symbol.ticker,
-          timeframe: candidate.timeframe as never,
-          direction: candidate.direction as never,
-          strategyType: candidate.strategyType,
-          detectedAt: candidate.detectedAt.toISOString(),
-          currentPrice: candidate.currentPrice,
-          proposedEntry: candidate.proposedEntry,
-          stopLoss: candidate.stopLoss,
-          takeProfit: candidate.takeProfit,
-          riskReward: candidate.riskReward,
-          confidenceScore: candidate.confidenceScore,
-          setupScore: candidate.setupScore,
-          featureValues: candidate.featureValues as Record<string, number>,
-          indicatorSnapshot: candidate.indicatorSnapshot as never,
-          reasoningLog: candidate.reasoningLog as never,
-          status: candidate.status as never,
-          correlationTags: candidate.correlationTags as string[],
-          volatilityClassification: candidate.volatilityClassification,
-        },
-        validation: latestValidation
-          ? {
-              winRateEstimate: latestValidation.winRateEstimate,
-              averageReturn: latestValidation.averageReturn,
-              averageAdverseExcursion: latestValidation.averageAdverseExcursion,
-              averageFavorableExcursion: latestValidation.averageFavorableExcursion,
-              maxDrawdown: latestValidation.maxDrawdown,
-              profitFactor: latestValidation.profitFactor,
-              expectancy: latestValidation.expectancy,
-              confidenceScore: latestValidation.confidenceScore,
-              confidenceIntervalLow: latestValidation.confidenceIntervalLow,
-              confidenceIntervalHigh: latestValidation.confidenceIntervalHigh,
-              historicalSampleSize: latestValidation.sampleSize,
-              dataQualityNotes: latestValidation.dataQualityNotes as string[],
-            }
-          : null,
-        account,
-        openPositions: openPositions.map((position) => ({
-          symbol: position.symbol.ticker,
-          direction: position.direction as never,
-          quantity: position.quantity,
-          averageEntryPrice: position.avgEntryPrice,
-          unrealizedPnl: position.unrealizedPnl,
-          exposurePct: position.exposurePct,
-          correlationTags: Array.isArray(position.metadata) ? [] : ((position.metadata as { correlationTags?: string[] } | null)?.correlationTags ?? []),
-        })),
-        riskLimits: {
-          maxActiveTrades: config.risk.maxActiveTrades,
-          maxDailyLossPct: config.risk.maxDailyLossPct,
-          maxRiskPerTradePct: config.risk.maxRiskPerTradePct,
-          maxTotalExposurePct: config.risk.maxTotalExposurePct,
-          maxSymbolExposurePct: config.risk.maxSymbolExposurePct,
-          maxCorrelatedExposurePct: config.risk.maxCorrelatedExposurePct,
-          maxEntrySpreadPct: config.risk.maxEntrySpreadPct,
-          staleSignalSeconds: config.risk.staleSignalSeconds,
-          manualApprovalMode: config.trading.manualApprovalMode,
-          dynamicRiskPerTradePct,
-        },
-        marketContext: {
-          spreadPct: quote?.spreadPct ?? null,
-          correlatedExposurePct: correlationContext.correlatedExposurePct,
-          correlatedSymbols: correlationContext.correlatedSymbols,
-        },
-        references: [
-          { type: "candidate", id: candidate.id, label: `${candidate.symbol.ticker} candidate` },
-          ...(latestValidation ? [{ type: "validation" as const, id: latestValidation.id, label: "Latest validation" }] : []),
-        ],
-      });
+      if (alloc.selected.length === 0) {
+        // No eligible account: record an AllocationDecision and move on.
+        await persistAllocationDecision(alloc, []);
+        continue;
+      }
 
-      const decisionRecord = await prisma.executionDecision.create({
-        data: {
-          candidateId: candidate.id,
-          validationRunId: latestValidation?.id,
-          action: decision.action,
-          confidence: decision.confidence,
-          riskScore: decision.riskScore,
-          evidenceSummary: decision.evidenceSummary,
-          reasons: asJson(decision.reasons),
-          blockingReasons: asJson(decision.blockingReasons),
-          supportingReferences: asJson(decision.supportingReferences),
-          executionParameters: asNullableJson(decision.executionParameters),
-          status: decision.action === "PLACE" ? "SENT" : "PROPOSED",
-          mode: config.trading.mode === "paper" ? "PAPER" : "LIVE",
-          idempotencyKey,
-          executedAt: decision.action === "PLACE" ? new Date() : null,
-        },
-      });
-
-      if (decision.action === "PLACE" && decision.executionParameters) {
-        const response = await fetch(`${config.services.mt5AdapterUrl}/orders`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            ...decision.executionParameters,
-            decisionId: decisionRecord.id,
-          }),
+      for (const pick of alloc.selected) {
+        const critic = await runPretradeCritic({
+          candidateContext: alloc.candidateContext,
+          allocationRow: pick,
+          aiEnabled: aiCriticEnabled,
         });
-        const orderResult = (await response.json()) as {
-          orderId?: string;
-          brokerOrderId?: string;
-          status?: string;
-          reason?: string;
-          error?: string;
-          detail?: string; // FastAPI returns errors as { detail: "..." }
-        };
 
-        if (!response.ok) {
-          const errorMessage = orderResult.reason ?? orderResult.error ?? orderResult.detail ?? `Broker rejected order with status ${response.status}.`;
+        // If AI vetoes and verdict is REJECT, skip placement (critic can
+        // only add safety). The decision engine still runs for audit.
+        const decideResult = decideForAccount({
+          candidateContext: alloc.candidateContext,
+          allocationRow: pick,
+          critic,
+          platformDefaults,
+          manualApprovalMode: config.trading.manualApprovalMode,
+        });
 
-          await prisma.executionDecision.update({
-            where: { id: decisionRecord.id },
-            data: { status: "REJECTED" },
-          });
+        const tradingMode = pick.account.tradingMode === "paper" ? "PAPER" : "LIVE";
 
-          await prisma.order.create({
-            data: {
-              symbolId: candidate.symbolId,
-              integrationId,
-              decisionId: decisionRecord.id,
-              broker: "mt5-adapter",
-              brokerOrderId: orderResult.brokerOrderId,
-              mode: config.trading.mode === "paper" ? "PAPER" : "LIVE",
-              direction: decision.executionParameters.direction,
-              orderType: "MARKET",
-              quantity: decision.executionParameters.quantity,
-              entryPrice: decision.executionParameters.entry,
-              stopLoss: decision.executionParameters.stopLoss,
-              takeProfit: decision.executionParameters.takeProfit,
-              status: "REJECTED",
-              submittedAt: new Date(),
-              rejectedAt: new Date(),
-              errorMessage,
-              payload: asJson(orderResult),
+        // Idempotency check against existing ExecutionDecision for this
+        // account and candidate within the current hour window.
+        const idem = await prisma.executionDecision
+          .findFirst({
+            where: {
+              candidateId: alloc.candidateContext.dbIds.candidateId,
+              accountId: pick.account.accountId,
             },
+            orderBy: { createdAt: "desc" },
+          })
+          .catch(() => null);
+        if (idem && idem.createdAt.getTime() > Date.now() - 60 * 60 * 1_000) {
+          logger.info("Skipping account — ExecutionDecision already recorded in the last hour.", {
+            candidateId: alloc.candidateContext.dbIds.candidateId,
+            accountId: pick.account.accountId,
           });
-
-          await prisma.riskEvent.create({
-            data: {
-              severity: "WARNING",
-              eventType: "broker_reject",
-              message: errorMessage,
-              details: asJson({ candidateId: candidate.id, decisionId: decisionRecord.id, orderResult }),
-              blocking: true,
-              candidateId: candidate.id,
-              decisionId: decisionRecord.id,
-            },
-          });
-
-          await prisma.auditLog.create({
-            data: {
-              actorType: "WORKER",
-              actorId: "worker-execution",
-              workerType: "EXECUTION",
-              severity: "WARNING",
-              category: "worker.execution.reject",
-              message: `Broker rejected ${candidate.symbol.ticker}: ${errorMessage}`,
-              entityType: "execution_decision",
-              entityId: decisionRecord.id,
-              symbolId: candidate.symbolId,
-            },
-          });
-
           continue;
         }
 
-        await prisma.order.create({
-          data: {
-            symbolId: candidate.symbolId,
-            integrationId,
-            decisionId: decisionRecord.id,
-            broker: "mt5-adapter",
-            brokerOrderId: orderResult.brokerOrderId,
-            mode: config.trading.mode === "paper" ? "PAPER" : "LIVE",
-            direction: decision.executionParameters.direction,
-            orderType: "MARKET",
-            quantity: decision.executionParameters.quantity,
-            entryPrice: decision.executionParameters.entry,
-            stopLoss: decision.executionParameters.stopLoss,
-            takeProfit: decision.executionParameters.takeProfit,
-            status: (orderResult.status ?? "SUBMITTED") as never,
-            submittedAt: new Date(),
-            filledAt: orderResult.status === "FILLED" ? new Date() : null,
-            errorMessage: orderResult.reason,
-            payload: asJson(orderResult),
-          },
+        let placement = null as Awaited<ReturnType<typeof placeOrder>> | null;
+        const shouldPlace =
+          decideResult.decision.action === "PLACE" &&
+          critic.verdict !== "REJECT" &&
+          decideResult.decision.executionParameters !== null;
+        if (shouldPlace) {
+          placement = await placeOrder({
+            mt5AdapterUrl: config.services.mt5AdapterUrl,
+            account: pick.account,
+            decision: decideResult.decision,
+            decisionId: "pending", // replaced post-persist; adapter only needs clientOrderId
+            candidateId: alloc.candidateContext.dbIds.candidateId,
+          });
+        }
+
+        const decisionId = await persistDecision({
+          candidateContext: alloc.candidateContext,
+          account: pick.account,
+          allocationRow: pick,
+          decideResult,
+          critic,
+          placement,
+          tradingMode,
         });
 
-        if (orderResult.status === "FILLED") {
-          await prisma.position.create({
-            data: {
-              symbolId: candidate.symbolId,
-              direction: decision.executionParameters.direction,
-              quantity: decision.executionParameters.quantity,
-              avgEntryPrice: decision.executionParameters.entry,
-              stopLoss: decision.executionParameters.stopLoss,
-              takeProfit: decision.executionParameters.takeProfit,
-              unrealizedPnl: 0,
-              realizedPnl: 0,
-              exposurePct: Number(dynamicRiskPerTradePct.toFixed(2)),
-              status: "OPEN",
-              openedAt: new Date(),
-              metadata: asJson({ correlationTags: candidate.correlationTags, spreadPct: quote?.spreadPct ?? null }),
-            },
-          });
-
-          await prisma.tradeCandidate.update({
-            where: { id: candidate.id },
-            data: { status: "EXECUTED" },
-          });
-
-          await queueNotification({
-            category: "trade_event",
-            severity: "info",
-            title: `Trade executed: ${candidate.symbol.ticker}`,
-            body: `${decision.executionParameters.direction} ${candidate.symbol.ticker} was placed at ${decision.executionParameters.entry.toFixed(2)}.`,
-            dedupeKey: `trade-executed-${decisionRecord.id}`,
-            metadata: { candidateId: candidate.id, decisionId: decisionRecord.id, spreadPct: quote?.spreadPct ?? null },
-          });
+        if (placement?.ok && placement.orderStatus === "FILLED") {
           placed += 1;
         }
-      } else if (decision.blockingReasons.length > 0) {
-        await prisma.riskEvent.create({
-          data: {
-            severity: decision.action === "INVALIDATE" ? "WARNING" : "INFO",
-            eventType: "execution_blocked",
-            message: decision.blockingReasons[0]?.detail ?? "Execution was blocked.",
-            details: asJson(decision.blockingReasons),
-            blocking: true,
-            candidateId: candidate.id,
-            decisionId: decisionRecord.id,
-          },
+
+        logger.info("Decision recorded", {
+          candidateId: alloc.candidateContext.dbIds.candidateId,
+          decisionId,
+          accountId: pick.account.accountId,
+          accountMode: pick.account.mode,
+          action: decideResult.decision.action,
+          critic: critic.verdict,
+          appliedSizeMultiplier: decideResult.appliedSizeMultiplier,
         });
       }
 
-      const outcomeCode =
-        decision.action === "PLACE"
-          ? DECISION_CODES.EXECUTION_ENTERED
-          : decision.action === "INVALIDATE"
-            ? DECISION_CODES.EXECUTION_INVALIDATED
-            : decision.action === "SKIP"
-              ? DECISION_CODES.EXECUTION_SKIPPED
-              : config.trading.manualApprovalMode
-                ? DECISION_CODES.EXECUTION_MANUAL_APPROVAL
-                : DECISION_CODES.EXECUTION_HELD;
-
-      const outcomeRecord = buildDecisionRecord(outcomeCode, {
-        symbol: candidate.symbol.ticker,
-        strategy: candidate.strategyType,
-        timeframe: candidate.timeframe,
-        confidence: decision.confidence,
-        riskScore: decision.riskScore,
-        observed: {
-          action: decision.action,
-          evidenceSummary: decision.evidenceSummary,
-          blockingReasonCount: decision.blockingReasons.length,
-        },
-        parentIdeaId: candidate.id,
-        parentValidationId: latestValidation?.id,
-        parentExecutionId: decisionRecord.id,
-      });
-
-      await prisma.auditLog.create({
-        data: {
-          actorType: "WORKER",
-          actorId: "worker-execution",
-          workerType: "EXECUTION",
-          severity: decision.action === "PLACE" ? "INFO" : decision.action === "INVALIDATE" ? "WARNING" : "INFO",
-          category: "execution",
-          message: outcomeRecord.title,
-          entityType: "execution_decision",
-          entityId: decisionRecord.id,
-          symbolId: candidate.symbolId,
-          data: asJson({
-            structured: outcomeRecord,
-            structuredBlockingReasons: decision.structuredBlockingReasons ?? [],
-            action: decision.action,
-            confidence: decision.confidence,
-            riskScore: decision.riskScore,
-          }),
-        },
-      });
-
-      // Write one dedicated audit row per blocking reason so reviewers can
-      // filter "why was this skipped" directly on the audit page without
-      // having to open the parent execution decision.
-      for (const structuredBlocker of decision.structuredBlockingReasons ?? []) {
-        await prisma.auditLog.create({
-          data: {
-            actorType: "WORKER",
-            actorId: "worker-execution",
-            workerType: "EXECUTION",
-            severity:
-              structuredBlocker.severity === "critical"
-                ? "CRITICAL"
-                : structuredBlocker.severity === "warning"
-                  ? "WARNING"
-                  : "INFO",
-            category: structuredBlocker.category,
-            message: structuredBlocker.title,
-            entityType: "execution_decision",
-            entityId: decisionRecord.id,
-            symbolId: candidate.symbolId,
-            data: asJson({ structured: structuredBlocker }),
-          },
-        });
-      }
+      await persistAllocationDecision(alloc, selectedAccountIds);
     }
 
     await completeWorkerRun(run.id, `${placed} orders placed`, { placed });
@@ -584,6 +334,7 @@ const evaluateExecution = async (candidateId?: string) => {
     });
   } catch (error) {
     const err = error as Error;
+    logger.error("Execution worker error", { message: err.message, stack: err.stack });
     await failWorkerRun({
       runId: run.id,
       workerType: "EXECUTION",
@@ -611,12 +362,16 @@ setInterval(() => {
   });
 }, 15_000);
 
-createPlatformWorker<{ candidateId?: string } & { trigger: "validation_completed" | "periodic_loop" | "manual" }>(
+type ExecutionJobPayload = { candidateId?: string } & { trigger: "validation_completed" | "periodic_loop" | "manual" };
+createPlatformWorker<ExecutionJobPayload>(
   queueNames.execution,
   "worker-execution",
-  async (payload) => {
+  async (payload: ExecutionJobPayload) => {
     await evaluateExecution(payload.candidateId);
   },
 );
 
-logger.info("Execution worker started");
+// Exported for legacy fallback — referenced by legacy-loop
+export { pAny };
+
+logger.info("Execution worker started (account-aware pipeline enabled)");

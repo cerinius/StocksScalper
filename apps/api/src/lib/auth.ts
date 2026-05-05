@@ -30,7 +30,7 @@ export const resolvePlatformUser = async (request: FastifyRequest) => {
     id: user.id,
     email: user.email,
     name: user.name,
-    roles: user.roles.map((entry) => entry.role.key),
+    roles: user.roles.map((entry: { role: { key: string } }) => entry.role.key),
   };
 };
 
@@ -54,7 +54,7 @@ export const requireRole =
       return { error: "Unauthorized" };
     }
 
-    if (!user.roles.some((role) => roles.includes(role))) {
+    if (!user.roles.some((role: string) => roles.includes(role))) {
       reply.code(403);
       return { error: "Forbidden" };
     }

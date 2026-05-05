@@ -289,6 +289,26 @@ button {
   margin: 8px 0 0;
 }
 
+.alert-banner {
+  display: grid;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  margin-bottom: 16px;
+}
+
+.alert-banner.tone-critical {
+  border-color: rgba(180, 35, 24, 0.34);
+  background: rgba(180, 35, 24, 0.1);
+  color: #7a1d19;
+}
+
+.alert-banner a {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
 @media (max-width: 980px) {
   .app-shell {
     grid-template-columns: 1fr;

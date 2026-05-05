@@ -1,0 +1,112 @@
+{
+  "_comment": "MT5 Manager — multi-account configuration. One entry per trading account.",
+
+  "gateway_port": 8000,
+  "bridge_auth_token": "local-mt5-bridge-token",
+
+  "worker_startup_delay_seconds": 45,
+  "worker_restart_delay_seconds": 10,
+
+  "accounts": [
+    {
+      "id": "account_1",
+      "name": "Account 1",
+      "login": 1114231,
+      "password": "CHANGE_ME",
+      "server": "OxSecurities-Demo",
+      "port": 8001,
+      "mt5_dir": "C:\\MT5Instances\\account_1",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_2",
+      "name": "Account 2",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8002,
+      "mt5_dir": "C:\\MT5Instances\\account_2",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_3",
+      "name": "Account 3",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8003,
+      "mt5_dir": "C:\\MT5Instances\\account_3",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_4",
+      "name": "Account 4",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8004,
+      "mt5_dir": "C:\\MT5Instances\\account_4",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_5",
+      "name": "Account 5",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8005,
+      "mt5_dir": "C:\\MT5Instances\\account_5",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_6",
+      "name": "Account 6",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8006,
+      "mt5_dir": "C:\\MT5Instances\\account_6",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_7",
+      "name": "Account 7",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8007,
+      "mt5_dir": "C:\\MT5Instances\\account_7",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_8",
+      "name": "Account 8",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8008,
+      "mt5_dir": "C:\\MT5Instances\\account_8",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_9",
+      "name": "Account 9",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8009,
+      "mt5_dir": "C:\\MT5Instances\\account_9",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "account_10",
+      "name": "Account 10",
+      "login": 0,
+      "password": "CHANGE_ME",
+      "server": "CHANGE_ME",
+      "port": 8010,
+      "mt5_dir": "C:\\MT5Instances\\account_10",
+      "timeout_ms": 60000
+    }
+  ]
+}

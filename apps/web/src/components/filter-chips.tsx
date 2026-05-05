@@ -12,7 +12,7 @@ export interface FilterChipsProps {
   label: string;
   options: FilterOption[];
   selected: string[];
-  onChange: (next: string[]) => void;
+  onChange(_next: string[]): void;
   /** Show an "All" (clear) chip as the first option. */
   allowClear?: boolean;
 }
@@ -59,7 +59,7 @@ export function FilterChips({ label, options, selected, onChange, allowClear = t
 
 export interface SearchBoxProps {
   value: string;
-  onChange: (next: string) => void;
+  onChange(_next: string): void;
   placeholder?: string;
   ariaLabel?: string;
 }
@@ -83,7 +83,7 @@ export interface GroupingToggleProps {
   label?: string;
   options: Array<{ value: string; label: string }>;
   value: string;
-  onChange: (next: string) => void;
+  onChange(_next: string): void;
 }
 
 export function GroupingToggle({ label = "Group by", options, value, onChange }: GroupingToggleProps) {

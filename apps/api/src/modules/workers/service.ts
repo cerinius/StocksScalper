@@ -8,10 +8,10 @@ export const getWorkersOverview = async () => {
   ]);
 
   return {
-    workers: heartbeats.map((heartbeat) => ({
+    workers: heartbeats.map((heartbeat: any) => ({
       ...heartbeat,
-      lastRun: runs.find((run) => run.workerType === heartbeat.workerType) ?? null,
-      recentFailures: failures.filter((failure) => failure.workerType === heartbeat.workerType).slice(0, 3),
+      lastRun: runs.find((run: any) => run.workerType === heartbeat.workerType) ?? null,
+      recentFailures: failures.filter((failure: any) => failure.workerType === heartbeat.workerType).slice(0, 3),
     })),
     recentRuns: runs,
     recentFailures: failures,

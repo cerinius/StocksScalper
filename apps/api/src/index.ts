@@ -18,6 +18,13 @@ import { auditPlugin } from "./modules/audit/plugin";
 import { notificationsPlugin } from "./modules/notifications/plugin";
 import { controlPlugin } from "./modules/control/plugin";
 import { webhooksPlugin } from "./modules/webhooks/plugin";
+import { accountsPlugin } from "./modules/accounts/plugin";
+import { allocationsPlugin } from "./modules/allocations/plugin";
+import { bridgePlugin } from "./modules/bridge/plugin";
+import { exposurePlugin } from "./modules/exposure/plugin";
+import { reviewsPlugin } from "./modules/reviews/plugin";
+import { lessonsPlugin } from "./modules/lessons/plugin";
+import { aiPlugin } from "./modules/ai/plugin";
 import { backtestRoutes } from "./routes/backtests";
 import { journalRoutes } from "./routes/journal";
 import { setupRoutes } from "./routes/setups";
@@ -64,6 +71,13 @@ const start = async () => {
   await app.register(notificationsPlugin);
   await app.register(controlPlugin);
   await app.register(webhooksPlugin);
+  await app.register(accountsPlugin);
+  await app.register(allocationsPlugin);
+  await app.register(bridgePlugin);
+  await app.register(exposurePlugin);
+  await app.register(reviewsPlugin);
+  await app.register(lessonsPlugin);
+  await app.register(aiPlugin);
 
   // Legacy-compatible routes
   await journalRoutes(app);

@@ -99,7 +99,7 @@ export const listExecutionDecisions = async (query: ExecutionListQuery): Promise
       take: query.pageSize,
     }),
     prisma.executionDecision.count({ where }),
-    prisma.executionDecision.count().then((count) => count > 0),
+    prisma.executionDecision.count().then((count: number) => count > 0),
   ]);
 
   return buildListEnvelope({
@@ -162,7 +162,7 @@ export const listOrders = async (query: OrderListQuery): Promise<ListEnvelope<un
       take: query.pageSize,
     }),
     prisma.order.count({ where }),
-    prisma.order.count().then((count) => count > 0),
+    prisma.order.count().then((count: number) => count > 0),
   ]);
 
   return buildListEnvelope({
@@ -218,7 +218,7 @@ export const listRiskEvents = async (query: RiskEventListQuery): Promise<ListEnv
       take: query.pageSize,
     }),
     prisma.riskEvent.count({ where }),
-    prisma.riskEvent.count().then((count) => count > 0),
+    prisma.riskEvent.count().then((count: number) => count > 0),
   ]);
 
   return buildListEnvelope({

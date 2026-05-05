@@ -39,18 +39,24 @@ async function main() {
   });
 
   // ── Integrations ─────────────────────────────────────────────────────────────────────────
-  // Respect the TRADING_MODE env var so the dashboard shows the correct mode.
+  // Respect the TRADING_MODE env var for order semantics, but never seed a
+  // synthetic paper broker account or synthetic balance snapshots.
   const tradingMode = (process.env.TRADING_MODE ?? "paper").toUpperCase() as "PAPER" | "LIVE";
-  const mt5Label = tradingMode === "LIVE"
-    ? "MT5 Live Broker (OxSecurities)"
-    : "MT5 Demo Broker (OxSecurities-Demo)";
+  const mt5Login = process.env.REAL_MT5_LOGIN?.trim() || process.env.MT5_LOGIN?.trim() || "321783474";
+  const mt5Label = `MT5 Demo ${mt5Login}`;
+  const mt5Config = asJson({
+    host: "http://mt5-adapter:4310",
+    realDataOnly: true,
+    paperBroker: false,
+    login: mt5Login,
+  });
 
   const mt5Integration = await prisma.integration.upsert({
     where: { id: "seed-mt5" },
     update: {
       name: mt5Label,
       mode: tradingMode,
-      configJson: asJson({ host: "http://mt5-adapter:4310", paper: tradingMode === "PAPER" }),
+      configJson: mt5Config,
     },
     create: {
       id: "seed-mt5",
@@ -58,17 +64,15 @@ async function main() {
       name: mt5Label,
       mode: tradingMode,
       enabled: true,
-      configJson: asJson({ host: "http://mt5-adapter:4310", paper: tradingMode === "PAPER" }),
+      configJson: mt5Config,
     },
   });
 
   await prisma.integrationStatus.create({
     data: {
       integrationId: mt5Integration.id,
-      status: "CONNECTED",
-      summary: tradingMode === "LIVE"
-        ? "Live MT5 adapter connected to OxSecurities."
-        : "Demo MT5 adapter connected to OxSecurities-Demo.",
+      status: "DISCONNECTED",
+      summary: "Waiting for the real MT5 bridge to confirm terminal and broker connectivity.",
       lastHeartbeatAt: new Date(),
     },
   });
@@ -197,6 +201,166 @@ async function main() {
       value: asJson({ active: false }),
       valueType: "json",
       description: "Manual emergency trading stop",
+    },
+  });
+
+  // ── Default Account (wraps the MT5 integration) ───────────────────────────────────────────
+  // The old schema treated the single MT5 integration as the "account". From
+  // multi-account onward, we model that explicitly as an Account row with a
+  // default rule profile + phase. Backfill below points historical rows at
+  // this account so nothing is orphaned.
+  //
+  // Circular FK note: Account.currentPhaseId → AccountPhase.id, but
+  // AccountPhase.accountId → Account.id. So we create the Account first
+  // (without currentPhaseId/activeRuleProfileId), then create the phase +
+  // rule profile, then UPDATE the Account to point at them.
+  const startingBalance = Number(process.env.DEFAULT_ACCOUNT_STARTING_BALANCE ?? 10_000);
+  const defaultAccountId = `mt5-${mt5Login}`;
+  const defaultPhaseId = `${defaultAccountId}-phase`;
+  const defaultRuleProfileId = `${defaultAccountId}-rule-profile`;
+  const accountDisplayName = `MT5 Demo ${mt5Login}`;
+
+  await prisma.account.upsert({
+    where: { id: defaultAccountId },
+    update: {
+      displayName: accountDisplayName,
+      tradingMode,
+      integrationId: mt5Integration.id,
+      brokerAccountLogin: mt5Login,
+      startingBalance,
+      tags: asJson(["mt5", "real-demo"]),
+      notes: "Real MT5 demo account. Live data is sourced only through the MT5 bridge.",
+    },
+    create: {
+      id: defaultAccountId,
+      displayName: accountDisplayName,
+      kind: "DEMO",
+      providerName: "MetaTrader 5",
+      brokerAccountLogin: mt5Login,
+      integrationId: mt5Integration.id,
+      currency: "USD",
+      startingBalance,
+      mode: "NORMAL",
+      health: "HEALTHY",
+      isActive: true,
+      tradingMode,
+      tags: asJson(["mt5", "real-demo"]),
+      notes: "Real MT5 demo account. Live data is sourced only through the MT5 bridge.",
+    },
+  });
+
+  const defaultRuleProfile = await prisma.accountRuleProfile.upsert({
+    where: { id: defaultRuleProfileId },
+    update: {
+      providerName: "MetaTrader 5",
+      startingBalance,
+    },
+    create: {
+      id: defaultRuleProfileId,
+      accountId: defaultAccountId,
+      version: 1,
+      isActive: true,
+      providerName: "MetaTrader 5",
+      providerRulesUrl: null,
+      startingBalance,
+      dailyLossLimitUsd: startingBalance * 0.03,
+      totalLossLimitUsd: startingBalance * 0.08,
+      trailingDrawdownUsd: null,
+      profitTargetUsd: null,
+      maxRiskPerTradePct: 0.005,
+      maxRiskPerTradeUsd: startingBalance * 0.005,
+      minRiskRewardRatio: 1.5,
+      maxOpenPositions: 3,
+      maxConcurrentRiskPct: 0.03,
+      maxCorrelatedPositions: 2,
+      allowedAssetClasses: asJson([]),
+      forbiddenAssetClasses: asJson([]),
+      allowedSessions: asJson([]),
+      forbiddenSessions: asJson([]),
+      allowedTimeframes: asJson([]),
+      noTradeBeforeUtc: null,
+      noTradeAfterUtc: null,
+      newsBlackoutMinutesBefore: 5,
+      newsBlackoutMinutesAfter: 10,
+      newsBlackoutUrgencies: asJson(["HIGH", "CRITICAL"]),
+      blockWeekendHold: true,
+      allowHedging: false,
+      cautiousLossFraction: 0.5,
+      recoveryLossFraction: 0.75,
+      targetNearFraction: null,
+      payoutEligibleAfter: 0,
+      payoutProtectWindowDays: 0,
+    },
+  });
+
+  const defaultPhase = await prisma.accountPhase.upsert({
+    where: { id: defaultPhaseId },
+    update: {
+      startingBalance,
+    },
+    create: {
+      id: defaultPhaseId,
+      accountId: defaultAccountId,
+      kind: "PERSONAL",
+      isActive: true,
+      startingBalance,
+      profitTargetUsd: null,
+      dailyLossLimitUsd: startingBalance * 0.03,
+      totalLossLimitUsd: startingBalance * 0.08,
+      outcome: "IN_PROGRESS",
+      reason: null,
+      notes: "Real MT5 demo account phase. Snapshot data must come from the MT5 bridge.",
+    },
+  });
+
+  // Point the account at its default phase + rule profile.
+  await prisma.account.update({
+    where: { id: defaultAccountId },
+    data: {
+      currentPhaseId: defaultPhase.id,
+      activeRuleProfileId: defaultRuleProfile.id,
+    },
+  });
+
+  // ── Backfill: historical rows (if any) get pointed at the default account ────────────────
+  // Safe/idempotent: only rows with accountId IS NULL get touched.
+  await prisma.$executeRawUnsafe(
+    `UPDATE "AccountSnapshot" SET "accountId" = $1, "accountPhaseId" = $2 WHERE "accountId" IS NULL`,
+    defaultAccountId,
+    defaultPhase.id,
+  );
+  await prisma.$executeRawUnsafe(
+    `UPDATE "Order" SET "accountId" = $1 WHERE "accountId" IS NULL`,
+    defaultAccountId,
+  );
+  await prisma.$executeRawUnsafe(
+    `UPDATE "Position" SET "accountId" = $1 WHERE "accountId" IS NULL`,
+    defaultAccountId,
+  );
+  await prisma.$executeRawUnsafe(
+    `UPDATE "ExecutionDecision" SET "accountId" = $1 WHERE "accountId" IS NULL`,
+    defaultAccountId,
+  );
+  await prisma.$executeRawUnsafe(
+    `UPDATE "RiskEvent" SET "accountId" = $1 WHERE "accountId" IS NULL AND "positionId" IS NOT NULL`,
+    defaultAccountId,
+  );
+
+  // ── Default setup allocation policy (personal account only) ──────────────────────────────
+  await prisma.setupAllocationPolicy.upsert({
+    where: { setupKey: "default" },
+    update: {},
+    create: {
+      setupKey: "default",
+      policy: "ONE_ACCOUNT_ONLY",
+      maxAccounts: 1,
+      requiredTags: asJson([]),
+      excludedTags: asJson([]),
+      allowedPhaseKinds: asJson([]),
+      allowedAccountModes: asJson(["NORMAL", "CAUTIOUS"]),
+      preferHigherHealth: true,
+      preferLowerUtilization: true,
+      notes: "Default fallback policy — one account per candidate.",
     },
   });
 

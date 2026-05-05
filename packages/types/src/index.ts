@@ -371,3 +371,12 @@ export const mt5OrderRequestSchema = z.object({
 export type TradingViewWebhookPayload = z.infer<typeof tradingViewWebhookSchema>;
 export type Mt5ConnectRequest = z.infer<typeof mt5ConnectRequestSchema>;
 export type Mt5OrderRequest = z.infer<typeof mt5OrderRequestSchema>;
+
+// Multi-account & funded-trading extensions
+export * from "./accounts";
+export * from "./allocation";
+export * from "./exposure";
+export * from "./supervision";
+export * from "./ai";
+export * from "./bridge";
+export * from "./journal";

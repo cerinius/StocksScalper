@@ -7,7 +7,7 @@ export interface ColumnDef<TRow> {
   key: string;
   header: ReactNode;
   /** Render the cell for this column. */
-  render: (row: TRow) => ReactNode;
+  render(_row: TRow): ReactNode;
   /** Whether this column supports click-to-sort. */
   sortable?: boolean;
   /** Sort field name to emit (defaults to `key`). */
@@ -23,12 +23,12 @@ export interface ColumnDef<TRow> {
 export interface DataTableProps<TRow> {
   columns: ColumnDef<TRow>[];
   rows: TRow[];
-  getRowKey: (row: TRow) => string;
+  getRowKey(_row: TRow): string;
   /** Called when the user clicks on a sortable column header. */
-  onSortChange?: (field: string, direction: "asc" | "desc") => void;
+  onSortChange?(_field: string, _direction: "asc" | "desc"): void;
   sort?: { field: string; direction: "asc" | "desc" };
   /** Optional expanded row content, rendered below the row when clicked. */
-  renderExpanded?: (row: TRow) => ReactNode;
+  renderExpanded?(_row: TRow): ReactNode;
   emptyState?: ReactNode;
   /** Extra className for outer container. */
   className?: string;

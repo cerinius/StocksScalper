@@ -37,8 +37,11 @@ services:
     env_file:
       - .env.local
     environment:
-      MT5_BRIDGE_URL: http://host.docker.internal:8000
+      MT5_BRIDGE_URL: ${MT5_BRIDGE_URL:-http://192.168.50.65:8000}
+      MT5_BRIDGE_AUTH_TOKEN: ${MT5_BRIDGE_AUTH_TOKEN:-local-mt5-bridge-token}
+      REAL_MT5_LOGIN: "1114231"
       MT5_ADAPTER_PORT: 4310
+      PAPER_BROKER_AUTO_CONNECT: "false"
     ports:
       - "${MT5_ADAPTER_PORT:-4310}:4310"
     restart: unless-stopped
@@ -61,6 +64,7 @@ services:
       MT5_ADAPTER_URL: http://mt5-adapter:4310
       NEXT_PUBLIC_API_BASE: http://localhost:4210
       NEXT_PUBLIC_GATEWAY_BASE: http://localhost:4211
+      REAL_MT5_LOGIN: "321783474"
     depends_on:
       postgres:
         condition: service_healthy
@@ -149,6 +153,10 @@ services:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
       MT5_ADAPTER_URL: http://mt5-adapter:4310
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: llama3.2:latest
+      OLLAMA_ENABLED: "true"
+      OLLAMA_PRETRADE_TIMEOUT_MS: 20000
     depends_on:
       api:
         condition: service_healthy
@@ -165,6 +173,7 @@ services:
     environment:
       DATABASE_URL: postgresql://stockradar:stockradar@postgres:5432/stockradar
       REDIS_URL: redis://redis:6379
+      MT5_ADAPTER_URL: http://mt5-adapter:4310
     depends_on:
       api:
         condition: service_healthy

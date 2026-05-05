@@ -113,7 +113,7 @@ export const listTradeIdeas = async (query: TradeIdeasQuery): Promise<ListEnvelo
     }),
     prisma.tradeCandidate.count({ where }),
     // Quick sanity check so the UI can distinguish "no data yet" from "filters hide everything".
-    prisma.tradeCandidate.count().then((count) => count > 0),
+    prisma.tradeCandidate.count().then((count: number) => count > 0),
   ]);
 
   return buildListEnvelope({

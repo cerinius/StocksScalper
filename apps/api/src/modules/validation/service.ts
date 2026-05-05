@@ -88,7 +88,7 @@ export const listValidationRuns = async (query: ValidationListQuery): Promise<Li
       take: query.pageSize,
     }),
     prisma.validationRun.count({ where }),
-    prisma.validationRun.count().then((count) => count > 0),
+    prisma.validationRun.count().then((count: number) => count > 0),
   ]);
 
   return buildListEnvelope({

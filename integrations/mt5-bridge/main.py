@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta
+from threading import Lock
+import secrets
+import time
+from typing import Any
 
 import MetaTrader5 as mt5
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from contextlib import asynccontextmanager
 
 from schemas import (
@@ -13,6 +17,7 @@ from schemas import (
     TickResponse,
 )
 from mt5_client import MT5Client
+from config import settings
 
 
 @asynccontextmanager
@@ -25,8 +30,78 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MT5 Bridge API", lifespan=lifespan)
 
 
+_command_cache_lock = Lock()
+_command_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
+
+
+def require_bridge_auth(authorization: str | None = Header(default=None)):
+    expected = settings.bridge_auth_token.strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="BRIDGE_AUTH_TOKEN is not configured")
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    provided = authorization.split(" ", 1)[1].strip()
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _purge_expired_command_cache(now_ts: float) -> None:
+    ttl = max(1, settings.command_id_ttl_seconds)
+    expired = [command_id for command_id, (expires_at, _status, _payload) in _command_cache.items() if expires_at <= now_ts]
+    for command_id in expired:
+        _command_cache.pop(command_id, None)
+
+
+def _get_cached_command(command_id: str) -> tuple[int, dict[str, Any]] | None:
+    now_ts = time.time()
+    with _command_cache_lock:
+        _purge_expired_command_cache(now_ts)
+        cached = _command_cache.get(command_id)
+        if not cached:
+            return None
+        _expires_at, status_code, payload = cached
+        return status_code, payload
+
+
+def _store_cached_command(command_id: str, status_code: int, payload: dict[str, Any]) -> None:
+    now_ts = time.time()
+    ttl = max(1, settings.command_id_ttl_seconds)
+    with _command_cache_lock:
+        _purge_expired_command_cache(now_ts)
+        if len(_command_cache) >= max(1, settings.command_id_cache_max_entries):
+            oldest_key = min(_command_cache.items(), key=lambda entry: entry[1][0])[0]
+            _command_cache.pop(oldest_key, None)
+        _command_cache[command_id] = (now_ts + ttl, status_code, payload)
+
+
+def _extract_required_command_id(request: Request) -> str:
+    command_id = request.headers.get("x-command-id", "").strip()
+    if not command_id:
+        raise HTTPException(status_code=400, detail="Missing required x-command-id header")
+    return command_id
+
+
+def _check_duplicate_command(command_id: str) -> None:
+    cached = _get_cached_command(command_id)
+    if cached is None:
+        return
+    status_code, payload = cached
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "Duplicate command id",
+            "commandId": command_id,
+            "originalStatus": status_code,
+            "originalResponse": payload,
+        },
+    )
+
+
 @app.get("/health", response_model=HealthResponse)
 def get_health():
+    """Public status endpoint — no auth required so monitoring tools can poll freely."""
     connected = MT5Client.initialize()
     if not connected:
         return HealthResponse(connected=False, error=str(mt5.last_error()))
@@ -47,7 +122,42 @@ def get_health():
     )
 
 
-@app.get("/account", response_model=AccountResponse)
+@app.get("/health/deep")
+def get_health_deep():
+    started_at = time.time()
+    connected = MT5Client.initialize()
+    term_info = mt5.terminal_info() if connected else None
+    acc_info = mt5.account_info() if connected else None
+
+    latency_ms = int((time.time() - started_at) * 1000)
+    terminal_connected = bool(term_info)
+    broker_connected = bool(acc_info)
+    login_matches = bool(acc_info and acc_info.login == settings.mt5_login)
+    status = "CONNECTED"
+    if not connected or not terminal_connected or not broker_connected:
+        status = "DISCONNECTED"
+    elif latency_ms > 2000:
+        status = "DEGRADED"
+
+    return {
+        "ok": connected and terminal_connected and broker_connected,
+        "reachable": connected,
+        "bridgeConnected": connected and terminal_connected,
+        "terminalConnected": terminal_connected,
+        "brokerConnected": broker_connected,
+        "loginMatches": login_matches,
+        "latencyMs": latency_ms,
+        "status": status,
+        "loginNumber": acc_info.login if acc_info else None,
+        "server": acc_info.server if acc_info else None,
+        "tradeAllowed": bool(getattr(term_info, "trade_allowed", False)) if term_info else False,
+        "lastTickTime": None,
+        "lastError": None if connected else str(mt5.last_error()),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/account", response_model=AccountResponse, dependencies=[Depends(require_bridge_auth)])
 def get_account():
     try:
         MT5Client.ensure_connected()
@@ -72,7 +182,7 @@ def get_account():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/symbols/{symbol}/tick", response_model=TickResponse)
+@app.get("/symbols/{symbol}/tick", response_model=TickResponse, dependencies=[Depends(require_bridge_auth)])
 def get_tick(symbol: str):
     try:
         MT5Client.ensure_connected()
@@ -96,7 +206,7 @@ def get_tick(symbol: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/positions", response_model=list[PositionResponse])
+@app.get("/positions", response_model=list[PositionResponse], dependencies=[Depends(require_bridge_auth)])
 def get_positions():
     try:
         MT5Client.ensure_connected()
@@ -124,10 +234,13 @@ def get_positions():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/orders")
-def place_order(req: MarketOrderRequest):
+@app.post("/orders", dependencies=[Depends(require_bridge_auth)])
+def place_order(req: MarketOrderRequest, request: Request):
+    command_id = _extract_required_command_id(request)
+    _check_duplicate_command(command_id)
+
     try:
-        return MT5Client.place_market_order(
+        result = MT5Client.place_market_order(
             req.symbol,
             req.side,
             req.volume,
@@ -135,27 +248,39 @@ def place_order(req: MarketOrderRequest):
             req.tp,
             req.comment,
         )
+        payload = {"commandId": command_id, **result}
+        _store_cached_command(command_id, 200, payload)
+        return payload
     except Exception as e:
+        _store_cached_command(command_id, 400, {"error": str(e)})
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/positions/{ticket}/close")
-def close_position(ticket: int):
+@app.post("/positions/{ticket}/close", dependencies=[Depends(require_bridge_auth)])
+def close_position(ticket: int, request: Request):
+    command_id = _extract_required_command_id(request)
+    _check_duplicate_command(command_id)
+
     try:
-        return MT5Client.close_position(ticket)
+        result = MT5Client.close_position(ticket)
+        payload = {"commandId": command_id, **result}
+        _store_cached_command(command_id, 200, payload)
+        return payload
     except ValueError as e:
+        _store_cached_command(command_id, 404, {"error": str(e)})
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        _store_cached_command(command_id, 400, {"error": str(e)})
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/connect")
+@app.post("/connect", dependencies=[Depends(require_bridge_auth)])
 def connect():
     connected = MT5Client.initialize()
     return {"connected": connected}
 
 
-@app.post("/disconnect")
+@app.post("/disconnect", dependencies=[Depends(require_bridge_auth)])
 def disconnect():
     MT5Client.shutdown()
     return {"connected": False}
@@ -208,7 +333,7 @@ def get_quote(symbol: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/orders")
+@app.get("/orders", dependencies=[Depends(require_bridge_auth)])
 def get_orders():
     try:
         MT5Client.ensure_connected()
@@ -233,7 +358,7 @@ def get_orders():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/history")
+@app.get("/history", dependencies=[Depends(require_bridge_auth)])
 def get_history():
     try:
         MT5Client.ensure_connected()

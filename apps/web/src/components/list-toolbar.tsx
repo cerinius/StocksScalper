@@ -86,8 +86,8 @@ export function ListToolbar({
 
 export interface PaginationControlsProps {
   meta: ListMeta | null | undefined;
-  onPageChange: (page: number) => void;
-  onPageSizeChange?: (size: number) => void;
+  onPageChange(_page: number): void;
+  onPageSizeChange?(_size: number): void;
   pageSizeOptions?: number[];
 }
 

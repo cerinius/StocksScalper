@@ -12,6 +12,7 @@
     "@stock-radar/config": "*",
     "@stock-radar/core": "*",
     "@stock-radar/db": "*",
+    "@stock-radar/ai": "*",
     "@stock-radar/logging": "*",
     "@stock-radar/queues": "*",
     "@stock-radar/shared": "*",

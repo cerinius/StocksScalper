@@ -171,6 +171,156 @@ enum ActorType {
   WEBHOOK
 }
 
+enum AccountKind {
+  PROP
+  PERSONAL
+  DEMO
+}
+
+enum AccountPhaseKind {
+  EVALUATION
+  VERIFICATION
+  FUNDED
+  PAYOUT_PROTECT
+  SCALE_UP
+  BREACHED
+  PASSED
+  PERSONAL
+}
+
+enum AccountPhaseOutcome {
+  IN_PROGRESS
+  PASSED
+  FAILED
+  WITHDRAWN
+}
+
+enum AccountMode {
+  NORMAL
+  CAUTIOUS
+  RECOVERY
+  TARGET_NEAR
+  PAYOUT_PROTECT
+  LOCKED
+}
+
+enum AccountHealth {
+  HEALTHY
+  WARNING
+  CRITICAL
+  BREACHED
+}
+
+enum AllocationPolicy {
+  ONE_ACCOUNT_ONLY
+  MAX_N_ACCOUNTS
+  ALL_ELIGIBLE
+  CHALLENGE_ONLY
+  FUNDED_ONLY
+  STRATEGY_TAGGED
+}
+
+enum AllocationStatus {
+  PENDING
+  ALLOCATED
+  SKIPPED
+  PARTIAL
+  FAILED
+}
+
+enum SupervisionAction {
+  HOLD
+  TIGHTEN_STOP
+  MOVE_TO_BREAKEVEN
+  SCALE_OUT
+  CLOSE
+  FORCE_CLOSE_BREACH
+  BLOCK_NEW_TRADES
+  LOCK_ACCOUNT
+  ENABLE_CAUTIOUS
+  ENABLE_RECOVERY
+  ENABLE_PAYOUT_PROTECT
+}
+
+enum SupervisionActionOrigin {
+  DETERMINISTIC
+  AI_SUGGESTED
+  MANUAL
+}
+
+enum AiReviewKind {
+  PRE_TRADE_CRITIC
+  POSITION_SUPERVISOR
+  POST_TRADE_JOURNAL
+  WEEKLY_REVIEW
+  NATURAL_LANGUAGE_QUERY
+  NEWS_REVIEW
+  RULE_DRIFT_REVIEW
+  SETUP_QUALITY_REVIEW
+}
+
+enum AiVerdict {
+  APPROVE
+  APPROVE_WITH_CAUTION
+  SUGGEST_REDUCE_SIZE
+  SUGGEST_TIGHTEN_STOP
+  SUGGEST_SCALE_OUT
+  SUGGEST_CLOSE
+  NEUTRAL
+  CONCERNED
+  OBJECT
+  NO_ACTION
+}
+
+enum RuleViolationOutcome {
+  BLOCKED
+  REDUCED
+  WARNED
+  RECORDED
+  FORCED_CLOSE
+}
+
+enum JournalExportStatus {
+  PENDING
+  WRITTEN
+  STALE
+  FAILED
+  SUPERSEDED
+}
+
+enum JournalNoteKind {
+  DAILY_SUMMARY
+  WEEKLY_REVIEW
+  SETUP_CARD
+  TRADE_NOTE
+  RULE_VIOLATION
+  AI_LESSON
+  ACCOUNT_OVERVIEW
+  NEWS_BRIEF
+  RUNBOOK
+}
+
+enum BridgeHealthStatus {
+  CONNECTED
+  DEGRADED
+  STALE
+  DISCONNECTED
+  ERROR
+}
+
+enum AiLessonSource {
+  POST_TRADE
+  WEEKLY
+  MANUAL
+  BACKTEST
+}
+
+enum PortfolioBucketKind {
+  SYMBOL
+  CORRELATION_GROUP
+  ASSET_CLASS
+}
+
 model User {
   id          String     @id @default(cuid())
   email       String     @unique
@@ -241,10 +391,12 @@ model Integration {
   createdAt  DateTime        @default(now())
   updatedAt  DateTime        @updatedAt
 
-  statuses         IntegrationStatus[]
-  providerConfigs  ProviderConfig[]
-  accountSnapshots AccountSnapshot[]
-  orders           Order[]
+  statuses          IntegrationStatus[]
+  providerConfigs   ProviderConfig[]
+  accountSnapshots  AccountSnapshot[]
+  orders            Order[]
+  accounts          Account[]
+  bridgeSnapshots   BridgeHealthSnapshot[]
 }
 
 model IntegrationStatus {
@@ -518,6 +670,7 @@ model TradeCandidate {
   decisions       ExecutionDecision[]
   riskEvents      RiskEvent[]
   incomingWebhooks IncomingWebhook[]
+  allocations     AllocationDecision[]
 
   @@index([symbolId, status, detectedAt])
   @@index([sourceWorkerType, detectedAt])
@@ -576,6 +729,8 @@ model BacktestResult {
 model ExecutionDecision {
   id                   String                  @id @default(cuid())
   candidateId          String
+  accountId            String?
+  allocationDecisionId String?
   validationRunId      String?
   action               ExecutionAction
   confidence           Float
@@ -585,6 +740,9 @@ model ExecutionDecision {
   blockingReasons      Json
   supportingReferences Json
   executionParameters  Json?
+  structuredReasons    Json?
+  preTradeAiReviewId   String?
+  ruleEvaluations      Json?
   status               ExecutionDecisionStatus @default(PROPOSED)
   mode                 TradingMode
   idempotencyKey       String                  @unique
@@ -592,95 +750,135 @@ model ExecutionDecision {
   executedAt           DateTime?
   updatedAt            DateTime                @updatedAt
 
-  candidate      TradeCandidate  @relation(fields: [candidateId], references: [id], onDelete: Cascade)
-  validationRun  ValidationRun?  @relation(fields: [validationRunId], references: [id], onDelete: SetNull)
-  orders         Order[]
-  riskEvents     RiskEvent[]
+  candidate          TradeCandidate       @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  account            Account?             @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  allocationDecision AllocationDecision?  @relation(fields: [allocationDecisionId], references: [id], onDelete: SetNull)
+  validationRun      ValidationRun?       @relation(fields: [validationRunId], references: [id], onDelete: SetNull)
+  preTradeAiReview   AiReview?            @relation("PreTradeCritic", fields: [preTradeAiReviewId], references: [id], onDelete: SetNull)
+  orders             Order[]
+  riskEvents         RiskEvent[]
+  aiReviews          AiReview[]           @relation("DecisionAiReviews")
+  ruleViolations     RuleViolation[]
 
   @@index([status, createdAt])
+  @@index([accountId, createdAt])
+  @@index([allocationDecisionId])
 }
 
 model Order {
-  id            String       @id @default(cuid())
-  symbolId      String
-  integrationId String?
-  decisionId    String?
-  broker        String
-  brokerOrderId String?      @unique
-  mode          TradingMode
-  direction     String
-  orderType     String
-  quantity      Float
-  entryPrice    Float
-  stopLoss      Float
-  takeProfit    Float
-  status        OrderStatus
-  submittedAt   DateTime?
-  filledAt      DateTime?
-  rejectedAt    DateTime?
-  payload       Json?
-  errorMessage  String?
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  id             String       @id @default(cuid())
+  symbolId       String
+  integrationId  String?
+  accountId      String?
+  decisionId     String?
+  broker         String
+  brokerOrderId  String?      @unique
+  clientOrderId  String?      @unique
+  mode           TradingMode
+  direction      String
+  orderType      String
+  quantity       Float
+  entryPrice     Float
+  stopLoss       Float
+  takeProfit     Float
+  riskUsd        Float?
+  status         OrderStatus
+  submittedAt    DateTime?
+  filledAt       DateTime?
+  rejectedAt     DateTime?
+  payload        Json?
+  errorMessage   String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
   symbol      Symbol             @relation(fields: [symbolId], references: [id], onDelete: Cascade)
   integration Integration?       @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  account     Account?           @relation(fields: [accountId], references: [id], onDelete: SetNull)
   decision    ExecutionDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
   positions   Position[]
 
   @@index([symbolId, status])
   @@index([decisionId])
+  @@index([accountId, status])
 }
 
 model Position {
-  id              String         @id @default(cuid())
-  symbolId        String
-  orderId         String?
-  brokerPositionId String?       @unique
-  direction       String
-  quantity        Float
-  avgEntryPrice   Float
-  stopLoss        Float
-  takeProfit      Float
-  unrealizedPnl   Float
-  realizedPnl     Float
-  exposurePct     Float
-  status          PositionStatus
-  openedAt        DateTime
-  closedAt        DateTime?
-  metadata        Json?
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
+  id               String         @id @default(cuid())
+  symbolId         String
+  accountId        String?
+  orderId          String?
+  brokerPositionId String?        @unique
+  direction        String
+  quantity         Float
+  avgEntryPrice    Float
+  stopLoss         Float
+  takeProfit       Float
+  unrealizedPnl    Float
+  realizedPnl      Float
+  exposurePct      Float
+  riskUsdAtEntry   Float?
+  currentRiskUsd   Float?
+  status           PositionStatus
+  openedAt         DateTime
+  closedAt         DateTime?
+  metadata         Json?
+  lastSupervisedAt DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
 
-  symbol     Symbol      @relation(fields: [symbolId], references: [id], onDelete: Cascade)
-  order      Order?      @relation(fields: [orderId], references: [id], onDelete: SetNull)
-  riskEvents RiskEvent[]
+  symbol             Symbol                      @relation(fields: [symbolId], references: [id], onDelete: Cascade)
+  order              Order?                      @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  account            Account?                    @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  riskEvents         RiskEvent[]
+  supervisionTicks   PositionSupervisionTick[]
+  aiReviews          AiReview[]                  @relation("PositionAiReviews")
 
   @@index([symbolId, status])
+  @@index([accountId, status])
 }
 
 model AccountSnapshot {
-  id               String      @id @default(cuid())
-  integrationId    String?
-  capturedAt       DateTime    @default(now())
-  balance          Float
-  equity           Float
-  freeMargin       Float
-  usedMargin       Float
-  marginLevel      Float
-  openPnl          Float
-  realizedPnlDaily Float
-  drawdownPct      Float
-  maxDrawdownPct   Float
-  riskState        RiskState
-  killSwitchActive Boolean     @default(false)
-  mode             TradingMode
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
+  id                     String         @id @default(cuid())
+  integrationId          String?
+  accountId              String?
+  accountPhaseId         String?
+  capturedAt             DateTime       @default(now())
+  balance                Float
+  equity                 Float
+  freeMargin             Float
+  usedMargin             Float
+  marginLevel            Float
+  openPnl                Float
+  realizedPnlDaily       Float
+  drawdownPct            Float
+  maxDrawdownPct         Float
+  riskState              RiskState
+  killSwitchActive       Boolean        @default(false)
+  mode                   TradingMode
+  accountMode            AccountMode?
+  accountHealth          AccountHealth?
+  phaseKind              AccountPhaseKind?
+  dailyLossUsedUsd       Float?
+  dailyLossUsedPct       Float?
+  dailyLossRemainingUsd  Float?
+  totalLossUsedUsd       Float?
+  totalLossUsedPct       Float?
+  totalLossRemainingUsd  Float?
+  distanceToTargetUsd    Float?
+  distanceToTargetPct    Float?
+  consecutiveLosers      Int?
+  openPositionCount      Int?
+  concurrentRiskUsd      Float?
+  concurrentRiskPct      Float?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
 
-  integration Integration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  integration   Integration?   @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  account       Account?       @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  accountPhase  AccountPhase?  @relation(fields: [accountPhaseId], references: [id], onDelete: SetNull)
 
   @@index([capturedAt])
+  @@index([accountId, capturedAt])
 }
 
 model RiskEvent {
@@ -693,15 +891,19 @@ model RiskEvent {
   candidateId String?
   decisionId  String?
   positionId  String?
+  accountId   String?
+  code        String?
   createdAt   DateTime @default(now())
   resolvedAt  DateTime?
   updatedAt   DateTime @updatedAt
 
-  candidate TradeCandidate?   @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  candidate TradeCandidate?    @relation(fields: [candidateId], references: [id], onDelete: SetNull)
   decision  ExecutionDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
-  position  Position?         @relation(fields: [positionId], references: [id], onDelete: SetNull)
+  position  Position?          @relation(fields: [positionId], references: [id], onDelete: SetNull)
+  account   Account?           @relation(fields: [accountId], references: [id], onDelete: SetNull)
 
   @@index([severity, createdAt])
+  @@index([accountId, createdAt])
 }
 
 model AuditLog {
@@ -769,4 +971,432 @@ model IncomingWebhook {
   createdCandidate TradeCandidate? @relation(fields: [createdCandidateId], references: [id], onDelete: SetNull)
 
   @@index([kind, createdAt])
+}
+
+// ============================================================================
+// Multi-account / funded-trading domain
+// ============================================================================
+
+model Account {
+  id                    String       @id @default(cuid())
+  displayName           String       @unique
+  kind                  AccountKind
+  providerName          String
+  brokerAccountLogin    String?
+  integrationId         String
+  currency              String       @default("USD")
+  startingBalance       Float
+  mode                  AccountMode  @default(NORMAL)
+  health                AccountHealth @default(HEALTHY)
+  isActive              Boolean      @default(true)
+  currentPhaseId        String?      @unique
+  activeRuleProfileId   String?      @unique
+  tradingMode           TradingMode  @default(PAPER)
+  tags                  Json         @default("[]")
+  notes                 String?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+
+  integration         Integration              @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+  currentPhase        AccountPhase?            @relation("CurrentAccountPhase", fields: [currentPhaseId], references: [id], onDelete: SetNull)
+  activeRuleProfile   AccountRuleProfile?      @relation("ActiveAccountRuleProfile", fields: [activeRuleProfileId], references: [id], onDelete: SetNull)
+  phases              AccountPhase[]           @relation("AccountPhases")
+  ruleProfiles        AccountRuleProfile[]     @relation("AccountRuleProfiles")
+  dailyMetrics        AccountDailyMetric[]
+  snapshots           AccountSnapshot[]
+  orders              Order[]
+  positions           Position[]
+  decisions           ExecutionDecision[]
+  riskEvents          RiskEvent[]
+  allocationCandidates AccountAllocationCandidate[]
+  bridgeSnapshots     BridgeHealthSnapshot[]
+  supervisionTicks    PositionSupervisionTick[]
+  aiReviews           AiReview[]
+  aiLessons           AiLesson[]
+  weeklyReviews       WeeklyReview[]
+  ruleViolations      RuleViolation[]
+  portfolioBuckets    PortfolioBucketExposure[]
+
+  @@index([kind, isActive])
+  @@index([providerName])
+}
+
+model AccountPhase {
+  id                   String                @id @default(cuid())
+  accountId            String
+  kind                 AccountPhaseKind
+  isActive             Boolean               @default(true)
+  startedAt            DateTime              @default(now())
+  endedAt              DateTime?
+  startingBalance      Float
+  profitTargetUsd      Float?
+  dailyLossLimitUsd    Float
+  totalLossLimitUsd    Float
+  outcome              AccountPhaseOutcome   @default(IN_PROGRESS)
+  reason               String?
+  notes                String?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  account          Account           @relation("AccountPhases", fields: [accountId], references: [id], onDelete: Cascade)
+  currentForAccount Account?         @relation("CurrentAccountPhase")
+  snapshots        AccountSnapshot[]
+
+  @@index([accountId, isActive])
+  @@index([kind, isActive])
+}
+
+model AccountRuleProfile {
+  id                         String   @id @default(cuid())
+  accountId                  String
+  version                    Int      @default(1)
+  isActive                   Boolean  @default(true)
+  providerName               String
+  providerRulesUrl           String?
+  startingBalance            Float
+  dailyLossLimitUsd          Float
+  totalLossLimitUsd          Float
+  trailingDrawdownUsd        Float?
+  profitTargetUsd            Float?
+  maxRiskPerTradePct         Float
+  maxRiskPerTradeUsd         Float
+  minRiskRewardRatio         Float    @default(1.5)
+  maxOpenPositions           Int      @default(3)
+  maxConcurrentRiskPct       Float    @default(0.03)
+  maxCorrelatedPositions     Int      @default(2)
+  allowedAssetClasses        Json     @default("[]")
+  forbiddenAssetClasses      Json     @default("[]")
+  allowedSessions            Json     @default("[]")
+  forbiddenSessions          Json     @default("[]")
+  allowedTimeframes          Json     @default("[]")
+  noTradeBeforeUtc           String?
+  noTradeAfterUtc            String?
+  newsBlackoutMinutesBefore  Int      @default(0)
+  newsBlackoutMinutesAfter   Int      @default(0)
+  newsBlackoutUrgencies      Json     @default("[]")
+  blockWeekendHold           Boolean  @default(true)
+  allowHedging               Boolean  @default(false)
+  cautiousLossFraction       Float    @default(0.5)
+  recoveryLossFraction       Float    @default(0.75)
+  targetNearFraction         Float?
+  payoutEligibleAfter        Int      @default(0)
+  payoutProtectWindowDays    Int      @default(0)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  account           Account  @relation("AccountRuleProfiles", fields: [accountId], references: [id], onDelete: Cascade)
+  currentForAccount Account? @relation("ActiveAccountRuleProfile")
+
+  @@unique([accountId, version])
+  @@index([accountId, isActive])
+}
+
+model AccountDailyMetric {
+  id                    String         @id @default(cuid())
+  accountId             String
+  date                  String         // YYYY-MM-DD
+  startingBalance       Float
+  startingEquity        Float
+  endingBalance         Float
+  endingEquity          Float
+  highWaterMark         Float
+  lowWaterMark          Float
+  realizedPnl           Float
+  unrealizedPnlClose    Float
+  totalFees             Float
+  tradesOpened          Int            @default(0)
+  tradesClosed          Int            @default(0)
+  winners               Int            @default(0)
+  losers                Int            @default(0)
+  dailyLossUsedPct      Float          @default(0)
+  totalLossUsedPct      Float          @default(0)
+  distanceToTargetPct   Float?
+  rulesViolated         Json           @default("[]")
+  modeEnded             AccountMode    @default(NORMAL)
+  healthEnded           AccountHealth  @default(HEALTHY)
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, date])
+  @@index([date])
+}
+
+// ============================================================================
+// Allocation
+// ============================================================================
+
+model AllocationDecision {
+  id                   String            @id @default(cuid())
+  candidateId          String
+  policy               AllocationPolicy
+  setupKey             String
+  status               AllocationStatus  @default(PENDING)
+  selectedAccountIds   Json              @default("[]")
+  summary              String?
+  idempotencyKey       String            @unique
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  candidate   TradeCandidate               @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  candidates  AccountAllocationCandidate[]
+  decisions   ExecutionDecision[]
+
+  @@index([candidateId, createdAt])
+  @@index([status, createdAt])
+}
+
+model AccountAllocationCandidate {
+  id                   String   @id @default(cuid())
+  allocationDecisionId String
+  accountId            String
+  selected             Boolean  @default(false)
+  totalScore           Float
+  componentsJson       Json
+  reasonCodes          Json     @default("[]")
+  message              String
+  proposedRiskUsd      Float?
+  proposedQuantity     Float?
+  proposedStopLoss     Float?
+  proposedTakeProfit   Float?
+  createdAt            DateTime @default(now())
+
+  allocationDecision AllocationDecision @relation(fields: [allocationDecisionId], references: [id], onDelete: Cascade)
+  account            Account            @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([allocationDecisionId, accountId])
+  @@index([accountId, createdAt])
+}
+
+model SetupAllocationPolicy {
+  id                 String            @id @default(cuid())
+  setupKey           String            @unique
+  policy             AllocationPolicy
+  maxAccounts        Int               @default(1)
+  requiredTags       Json              @default("[]")
+  excludedTags       Json              @default("[]")
+  allowedPhaseKinds  Json              @default("[]")
+  allowedAccountModes Json             @default("[]")
+  preferHigherHealth Boolean           @default(true)
+  preferLowerUtilization Boolean       @default(true)
+  notes              String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+}
+
+// ============================================================================
+// Portfolio exposure
+// ============================================================================
+
+model PortfolioBucketExposure {
+  id                       String              @id @default(cuid())
+  kind                     PortfolioBucketKind
+  bucketKey                String
+  accountId                String?
+  asOf                     DateTime            @default(now())
+  accountCount             Int                 @default(0)
+  openPositionCount        Int                 @default(0)
+  netQuantityLong          Float               @default(0)
+  netQuantityShort         Float               @default(0)
+  netDirection             String              @default("FLAT")
+  grossRiskUsd             Float               @default(0)
+  netRiskUsd               Float               @default(0)
+  aggregateUnrealizedPnl   Float               @default(0)
+  aggregateExposurePct     Float               @default(0)
+  perAccountJson           Json                @default("[]")
+  createdAt                DateTime            @default(now())
+
+  account Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([kind, bucketKey, asOf])
+  @@index([accountId, asOf])
+}
+
+// ============================================================================
+// Bridge health
+// ============================================================================
+
+model BridgeHealthSnapshot {
+  id                    String             @id @default(cuid())
+  accountId             String
+  integrationId         String
+  bridgeHost            String
+  capturedAt            DateTime           @default(now())
+  status                BridgeHealthStatus
+  terminalConnected     Boolean            @default(false)
+  brokerConnected       Boolean            @default(false)
+  accountLogin          String?
+  server                String?
+  pingMs                Int?
+  lastOrderAckMs        Int?
+  lastPositionSyncMs    Int?
+  lastHeartbeatAt       DateTime
+  stalenessSeconds      Int                @default(0)
+  sdkVersion            String?
+  notes                 String?
+
+  account     Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, capturedAt])
+  @@index([status, capturedAt])
+}
+
+// ============================================================================
+// Supervision
+// ============================================================================
+
+model PositionSupervisionTick {
+  id                    String                  @id @default(cuid())
+  positionId            String
+  accountId             String
+  asOf                  DateTime                @default(now())
+  unrealizedPnlPct      Float
+  adversePct            Float
+  timeInTradeMinutes    Int
+  invalidationTriggered Boolean                 @default(false)
+  suggestedAction       SupervisionAction
+  origin                SupervisionActionOrigin @default(DETERMINISTIC)
+  reasonCodes           Json                    @default("[]")
+  reasonSummary         String
+  aiReviewId            String?
+  aiAdvisoryVerdict     AiVerdict?
+  aiAdvisoryReasoning   String?
+  executed              Boolean                 @default(false)
+  executedAt            DateTime?
+  errorMessage          String?
+
+  position Position  @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  account  Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  aiReview AiReview? @relation("SupervisionAiReviews", fields: [aiReviewId], references: [id], onDelete: SetNull)
+
+  @@index([positionId, asOf])
+  @@index([accountId, asOf])
+  @@index([suggestedAction, asOf])
+}
+
+model RuleViolation {
+  id              String                @id @default(cuid())
+  accountId       String
+  ruleCode        String
+  severity        Severity
+  outcome         RuleViolationOutcome
+  message         String
+  observedJson    Json?
+  expectedJson    Json?
+  candidateId     String?
+  decisionId      String?
+  positionId      String?
+  createdAt       DateTime              @default(now())
+  resolvedAt      DateTime?
+  updatedAt       DateTime              @updatedAt
+
+  account   Account             @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  decision  ExecutionDecision?  @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+
+  @@index([accountId, createdAt])
+  @@index([ruleCode, createdAt])
+}
+
+// ============================================================================
+// AI (advisory only)
+// ============================================================================
+
+model AiReview {
+  id                     String        @id @default(cuid())
+  kind                   AiReviewKind
+  accountId              String?
+  candidateId            String?
+  decisionId             String?
+  positionId             String?
+  correlationId          String
+  model                  String
+  promptVersion          String
+  promptTokens           Int           @default(0)
+  responseTokens         Int           @default(0)
+  latencyMs              Int           @default(0)
+  contextDigest          String
+  rawPromptRef           String?
+  rawResponseRef         String?
+  verdict                AiVerdict
+  confidence             Float
+  summary                String
+  concerns               Json          @default("[]")
+  suggestions            Json          @default("[]")
+  structuredOutput       Json?
+  safetyFiltered         Boolean       @default(false)
+  safetyFilterReasons    Json          @default("[]")
+  createdAt              DateTime      @default(now())
+
+  account             Account?          @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  decision            ExecutionDecision? @relation("DecisionAiReviews", fields: [decisionId], references: [id], onDelete: SetNull)
+  position            Position?         @relation("PositionAiReviews", fields: [positionId], references: [id], onDelete: SetNull)
+  supervisionTicks    PositionSupervisionTick[] @relation("SupervisionAiReviews")
+  preTradeFor         ExecutionDecision[]       @relation("PreTradeCritic")
+
+  @@index([kind, createdAt])
+  @@index([accountId, kind, createdAt])
+  @@index([correlationId])
+}
+
+model AiLesson {
+  id           String          @id @default(cuid())
+  sourceKind   AiLessonSource
+  sourceId     String?
+  accountId    String?
+  title        String
+  detail       String
+  tags         Json            @default("[]")
+  weight       Float           @default(0.5)
+  active       Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  account Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([active, updatedAt])
+  @@index([accountId, active])
+}
+
+model WeeklyReview {
+  id               String   @id @default(cuid())
+  accountId        String?
+  weekStart        String
+  weekEnd          String
+  kpis             Json     @default("{}")
+  output           Json
+  aiReviewId       String?  @unique
+  obsidianNoteRef  String?
+  createdAt        DateTime @default(now())
+
+  account Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@unique([accountId, weekStart])
+  @@index([weekStart])
+}
+
+// ============================================================================
+// Journal exporter (Obsidian)
+// ============================================================================
+
+model JournalExport {
+  id             String               @id @default(cuid())
+  kind           JournalNoteKind
+  entityId       String
+  bucket         String
+  accountId      String?
+  relativePath   String
+  contentHash    String
+  status         JournalExportStatus  @default(PENDING)
+  attempts       Int                  @default(0)
+  lastAttemptAt  DateTime?
+  lastError      String?
+  writtenAt      DateTime?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  @@unique([kind, entityId, bucket])
+  @@index([status, updatedAt])
+  @@index([accountId, updatedAt])
 }

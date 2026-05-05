@@ -59,14 +59,25 @@ export function Panel({ title, subtitle, children }: PropsWithChildren<{ title: 
   );
 }
 
-export function StatusPill({ value }: { value: string }) {
-  const tone = value.toLowerCase().includes("critical")
-    ? "critical"
-    : value.toLowerCase().includes("warning") || value.toLowerCase().includes("degraded")
-      ? "warn"
-      : value.toLowerCase().includes("open") || value.toLowerCase().includes("connected") || value.toLowerCase().includes("healthy")
-        ? "good"
-        : "default";
+export function StatusPill({
+  value,
+  tone,
+  label,
+}: {
+  value?: string;
+  tone?: "default" | "good" | "warn" | "critical";
+  label?: string;
+}) {
+  const displayText = label ?? value ?? "";
+  const resolvedTone = tone ?? (
+    displayText.toLowerCase().includes("critical")
+      ? "critical"
+      : displayText.toLowerCase().includes("warning") || displayText.toLowerCase().includes("degraded")
+        ? "warn"
+        : displayText.toLowerCase().includes("open") || displayText.toLowerCase().includes("connected") || displayText.toLowerCase().includes("healthy")
+          ? "good"
+          : "default"
+  );
 
-  return <span className={`status-pill tone-${tone}`}>{value}</span>;
+  return <span className={`status-pill tone-${resolvedTone}`}>{displayText}</span>;
 }

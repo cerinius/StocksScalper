@@ -6,6 +6,11 @@ import { completeWorkerRun, createWorkerRun, failWorkerRun, prisma, upsertWorker
 import { createLogger } from "@stock-radar/logging";
 import { createPlatformWorker, ensureDefaultSchedules, queueNames, queueNotification } from "@stock-radar/queues";
 import { stableHash } from "@stock-radar/shared";
+import { runPositionSupervisor } from "./jobs/position-supervisor";
+import { runPostTradeReviewer } from "./jobs/post-trade-reviewer";
+import { runWeeklySynthesis } from "./jobs/weekly-synthesis";
+import { runPortfolioExposureSnapshot } from "./jobs/portfolio-exposure";
+import { runJournalExportSweeper } from "./jobs/journal-export-sweeper";
 
 const config = getPlatformConfig();
 const logger = createLogger("worker-supervisor");
@@ -82,10 +87,12 @@ const maybeThrottleRisk = async (
   });
 
   const expectancies = recentPlacedDecisions
-    .map((decision) => decision.validationRun?.expectancy ?? null)
-    .filter((value): value is number => typeof value === "number");
+    .map((decision: any) => decision.validationRun?.expectancy ?? null)
+    .filter((value: unknown): value is number => typeof value === "number");
   const averageExpectancy =
-    expectancies.length === 0 ? 0 : expectancies.reduce((total, value) => total + value, 0) / expectancies.length;
+    expectancies.length === 0
+      ? 0
+      : expectancies.reduce((total: number, value: number) => total + value, 0) / expectancies.length;
   const realizedLossPct =
     account.balance <= 0 ? 0 : Math.max(0, (-Math.min(account.realizedPnlDaily, 0) / account.balance) * 100);
   const drawdownPressure = account.drawdownPct >= Math.max(1, config.risk.maxDailyLossPct * 0.5);
@@ -246,30 +253,107 @@ const syncMT5Account = async () => {
  */
 const syncMT5Positions = async () => {
   const url = `${config.services.mt5AdapterUrl}/positions`;
-  let mt5Positions: Array<{
-    ticket: number;
+
+  // The adapter returns different schemas depending on whether it is connected
+  // to the live Python bridge or running in paper mode:
+  //   Live bridge:  { ticket, symbol, type: "buy"|"sell", volume, price_open, sl, tp, profit }
+  //   Paper mode:   { brokerPositionId, symbol, direction: "LONG"|"SHORT",
+  //                   quantity, averageEntryPrice, stopLoss, takeProfit, unrealizedPnl }
+  // We normalise both into a single shape before processing.
+  interface NormalisedPosition {
+    ticketKey: string;       // unique broker key for deduplication
+    ticketNum: number | undefined; // numeric ticket for metadata (live only)
     symbol: string;
-    type: string;
+    direction: "LONG" | "SHORT";
     volume: number;
-    price_open: number;
+    priceOpen: number;
     sl: number;
     tp: number;
     profit: number;
-  }>;
+  }
 
+  const normalisePosition = (raw: Record<string, unknown>): NormalisedPosition | null => {
+    const sym = typeof raw.symbol === "string" ? raw.symbol : "";
+    if (!sym) return null;
+
+    // Live bridge format — ticket is a numeric MT5 position ticket
+    if (typeof raw.ticket === "number") {
+      const ticket = raw.ticket;
+      // Use Number(...) || 0 so NaN, undefined, and 0 all fall back to 0
+      const priceOpen = Number(raw.price_open) || 0;
+      const direction: "LONG" | "SHORT" = raw.type === "buy" ? "LONG" : "SHORT";
+      return {
+        ticketKey: String(ticket),
+        ticketNum: ticket,
+        symbol: sym,
+        direction,
+        volume: Number(raw.volume) || 0,
+        priceOpen,
+        sl: Number(raw.sl) || 0,
+        tp: Number(raw.tp) || 0,
+        profit: Number(raw.profit) || 0,
+      };
+    }
+
+    // Live bridge edge case — price_open present but no ticket yet (rare, e.g. pending)
+    // Build a stable dedup key from symbol + direction + rounded price so we don't
+    // create duplicate DB rows on each sync cycle.
+    if (typeof raw.price_open === "number") {
+      const priceOpen = raw.price_open;
+      const direction: "LONG" | "SHORT" = raw.type === "buy" ? "LONG" : "SHORT";
+      const stableKey = `live-${sym}-${direction}-${Math.round(priceOpen * 10000)}`;
+      return {
+        ticketKey: stableKey,
+        ticketNum: undefined,
+        symbol: sym,
+        direction,
+        volume: Number(raw.volume) || 0,
+        priceOpen,
+        sl: Number(raw.sl) || 0,
+        tp: Number(raw.tp) || 0,
+        profit: Number(raw.profit) || 0,
+      };
+    }
+
+    // Paper mode adapter format
+    const brokerId = raw.brokerPositionId ?? raw.positionId;
+    if (brokerId != null) {
+      const dir = typeof raw.direction === "string" ? raw.direction.toUpperCase() : "LONG";
+      const priceOpen = Number(raw.averageEntryPrice) || 0;
+      return {
+        ticketKey: String(brokerId),
+        ticketNum: undefined,
+        symbol: sym,
+        direction: dir === "SHORT" ? "SHORT" : "LONG",
+        volume: Number(raw.quantity) || 0,
+        priceOpen,
+        sl: Number(raw.stopLoss) || 0,
+        tp: Number(raw.takeProfit) || 0,
+        profit: Number(raw.unrealizedPnl) || 0,
+      };
+    }
+
+    return null;
+  };
+
+  let rawPositions: Array<Record<string, unknown>>;
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) {
       logger.warn("MT5 position sync skipped — adapter returned non-200", { status: res.status });
       return;
     }
-    mt5Positions = (await res.json()) as typeof mt5Positions;
+    rawPositions = (await res.json()) as Array<Record<string, unknown>>;
   } catch (err) {
     logger.warn("MT5 position sync failed — adapter unreachable", { error: (err as Error).message });
     return;
   }
 
-  if (!Array.isArray(mt5Positions)) return;
+  if (!Array.isArray(rawPositions)) return;
+
+  const mt5Positions: NormalisedPosition[] = rawPositions
+    .map(normalisePosition)
+    .filter((p): p is NormalisedPosition => p !== null);
 
   // Load all open DB positions
   const dbPositions = await prisma.position.findMany({
@@ -277,18 +361,17 @@ const syncMT5Positions = async () => {
     include: { symbol: true },
   });
 
-  const dbByTicket = new Map(
+  const dbByTicket = new Map<string, (typeof dbPositions)[number]>(
     dbPositions
-      .filter((p) => p.brokerPositionId != null)
-      .map((p) => [String(p.brokerPositionId), p]),
+      .filter((p: (typeof dbPositions)[number]) => p.brokerPositionId != null)
+      .map((p: (typeof dbPositions)[number]) => [String(p.brokerPositionId), p]),
   );
 
-  const mt5TicketSet = new Set(mt5Positions.map((p) => String(p.ticket)));
+  const mt5TicketSet = new Set(mt5Positions.map((p) => p.ticketKey));
 
   // ── 1. Update existing or create new positions from MT5 ──────────────────
   for (const mp of mt5Positions) {
-    const ticketKey = String(mp.ticket);
-    const direction: "LONG" | "SHORT" = mp.type === "buy" ? "LONG" : "SHORT";
+    const { ticketKey, ticketNum, direction } = mp;
     const existing = dbByTicket.get(ticketKey);
 
     if (existing) {
@@ -339,15 +422,15 @@ const syncMT5Positions = async () => {
           brokerPositionId: ticketKey,
           direction,
           quantity: mp.volume,
-          avgEntryPrice: mp.price_open,
-          stopLoss: mp.sl > 0 ? mp.sl : mp.price_open * (direction === "LONG" ? 0.98 : 1.02),
-          takeProfit: mp.tp > 0 ? mp.tp : mp.price_open * (direction === "LONG" ? 1.04 : 0.96),
+          avgEntryPrice: mp.priceOpen,
+          stopLoss: mp.sl > 0 ? mp.sl : mp.priceOpen * (direction === "LONG" ? 0.98 : 1.02),
+          takeProfit: mp.tp > 0 ? mp.tp : mp.priceOpen * (direction === "LONG" ? 1.04 : 0.96),
           unrealizedPnl: mp.profit,
           realizedPnl: 0,
           exposurePct: 1.0,
           status: "OPEN",
           openedAt: new Date(),
-          metadata: { source: "mt5_sync", ticket: mp.ticket },
+          metadata: { source: "mt5_sync", ticket: ticketNum ?? ticketKey },
         },
       });
 
@@ -355,7 +438,7 @@ const syncMT5Positions = async () => {
         symbol: mp.symbol,
         direction,
         volume: mp.volume,
-        ticket: mp.ticket,
+        ticket: ticketKey,
         profit: mp.profit,
       });
 
@@ -366,7 +449,7 @@ const syncMT5Positions = async () => {
           workerType: "SUPERVISOR",
           severity: "INFO",
           category: "mt5_sync",
-          message: `Imported MT5 position ticket ${mp.ticket} (${mp.symbol} ${direction} ${mp.volume} lots @ ${mp.price_open})`,
+          message: `Imported MT5 position ticket ${ticketKey} (${mp.symbol} ${direction} ${mp.volume} lots @ ${mp.priceOpen})`,
           entityType: "position",
           entityId: ticketKey,
           symbolId: symbol.id,
@@ -418,6 +501,130 @@ const syncMT5Positions = async () => {
   }
 };
 
+// ─── Bridge Health Sync ─────────────────────────────────────────────────────
+
+const resolveBridgeHost = () => {
+  try {
+    const url = new URL(config.services.mt5AdapterUrl);
+    return `${url.hostname}:${url.port}`;
+  } catch {
+    return config.services.mt5AdapterUrl;
+  }
+};
+
+const fetchAdapterHealth = async (): Promise<{
+  reachable: boolean;
+  bridgeConnected: boolean;
+  latencyMs: number | null;
+  bridgeError: string | null;
+}> => {
+  const startedAt = Date.now();
+  try {
+    let response = await fetch(`${config.services.mt5AdapterUrl}/health/deep`, {
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!response.ok) {
+      response = await fetch(`${config.services.mt5AdapterUrl}/health`, {
+        signal: AbortSignal.timeout(8_000),
+      });
+    }
+    const latencyMs = Date.now() - startedAt;
+    if (!response.ok) {
+      return {
+        reachable: false,
+        bridgeConnected: false,
+        latencyMs,
+        bridgeError: `Adapter health endpoint returned ${response.status}`,
+      };
+    }
+    const payload = (await response.json()) as {
+      reachable?: boolean;
+      bridgeConnected?: boolean;
+      bridgeError?: string | null;
+    };
+    return {
+      reachable: payload.reachable ?? true,
+      bridgeConnected: payload.bridgeConnected === true,
+      latencyMs,
+      bridgeError: payload.bridgeError ?? null,
+    };
+  } catch (error) {
+    return {
+      reachable: false,
+      bridgeConnected: false,
+      latencyMs: null,
+      bridgeError: (error as Error).message,
+    };
+  }
+};
+
+/**
+ * Persist one BridgeHealthSnapshot per active account on every
+ * supervisor health cycle. This gives the stale-bridge gate a concrete
+ * heartbeat source and powers the /bridge page + dashboard warning.
+ */
+const syncBridgeHealthSnapshots = async () => {
+  const accounts = await prisma.account.findMany({
+    where: { isActive: true },
+    select: {
+      id: true,
+      displayName: true,
+      integrationId: true,
+      brokerAccountLogin: true,
+    },
+  });
+
+  if (accounts.length === 0) {
+    return;
+  }
+
+  const bridgeHost = resolveBridgeHost();
+  const health = await fetchAdapterHealth();
+  const now = new Date();
+
+  const status = !health.reachable
+    ? "DISCONNECTED"
+    : !health.bridgeConnected
+      ? "DISCONNECTED"
+      : (health.latencyMs ?? 0) > 2_000
+        ? "DEGRADED"
+        : "CONNECTED";
+
+  const stalenessSeconds = status === "CONNECTED" || status === "DEGRADED" ? 0 : 999;
+
+  await prisma.$transaction(
+    accounts.map((account: { id: string; integrationId: string; brokerAccountLogin: string | null }) =>
+      prisma.bridgeHealthSnapshot.create({
+        data: {
+          accountId: account.id,
+          integrationId: account.integrationId,
+          bridgeHost,
+          status: status as "CONNECTED" | "DEGRADED" | "STALE" | "DISCONNECTED" | "ERROR",
+          terminalConnected: health.bridgeConnected,
+          brokerConnected: health.bridgeConnected,
+          accountLogin: account.brokerAccountLogin,
+          server: null,
+          pingMs: health.latencyMs,
+          lastOrderAckMs: null,
+          lastPositionSyncMs: null,
+          lastHeartbeatAt: now,
+          stalenessSeconds,
+          sdkVersion: null,
+          notes: health.bridgeError,
+        },
+      }),
+    ),
+  );
+
+  logger.info("Bridge health snapshots written", {
+    accounts: accounts.length,
+    status,
+    latencyMs: health.latencyMs,
+    bridgeConnected: health.bridgeConnected,
+    bridgeError: health.bridgeError,
+  });
+};
+
 // ─── Price Bar Helpers ────────────────────────────────────────────────────────
 
 /** Fetch recent price bars for a symbol+timeframe from the DB */
@@ -428,7 +635,7 @@ const getRecentBars = async (symbolId: string, timeframe: string, take = 30): Pr
     take,
     select: { open: true, high: true, low: true, close: true, volume: true, timestamp: true },
   });
-  return rows.map((r) => ({
+  return rows.map((r: { open: number; high: number; low: number; close: number; volume: number; timestamp: Date }) => ({
     symbol: symbolId,
     timeframe: timeframe as PriceBar["timeframe"],
     timestamp: r.timestamp.toISOString(),
@@ -570,11 +777,19 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
       // Sync live MT5 account state → AccountSnapshot (drives dashboard balance/equity/PnL)
       await syncMT5Account();
 
+      // Sync bridge freshness/status per active account for stale-bridge gating.
+      await syncBridgeHealthSnapshots();
+
       // Sync live MT5 positions → DB (reconcile open/closed, import new)
       await syncMT5Positions();
 
       // Manage ATR trailing stops on all open positions
       await manageTrailingStops();
+
+      // AI-assisted position supervision (rate-limited per-position)
+      await runPositionSupervisor(config.services.mt5AdapterUrl).catch((err) => {
+        logger.warn("Position supervisor cycle error", { error: (err as Error).message });
+      });
 
       const throttleEvent = await maybeThrottleRisk(
         account
@@ -587,7 +802,7 @@ const processSupervisorJob = async (trigger: "health_check" | "daily_summary" | 
       );
 
       const workerAlerts = summarizeWorkerHealth(
-        heartbeats.map((heartbeat) => ({
+        heartbeats.map((heartbeat: any) => ({
           workerType: heartbeat.workerType.toLowerCase() as "news" | "market" | "validation" | "execution" | "supervisor",
           status:
             Date.now() - heartbeat.lastSeenAt.getTime() > config.schedules.supervisorMs * 4
@@ -745,6 +960,39 @@ setInterval(() => {
     currentTask: "monitoring",
   });
 }, 15_000);
+
+// Portfolio exposure snapshot — every 30s
+setInterval(() => {
+  void runPortfolioExposureSnapshot().catch((err) => {
+    logger.warn("Portfolio exposure snapshot error", { error: (err as Error).message });
+  });
+}, 30_000);
+
+// Post-trade reviewer — every 60s
+setInterval(() => {
+  void runPostTradeReviewer().catch((err) => {
+    logger.warn("Post-trade reviewer error", { error: (err as Error).message });
+  });
+}, 60_000);
+
+// Journal export sweeper — every 5 minutes
+setInterval(() => {
+  void runJournalExportSweeper().catch((err) => {
+    logger.warn("Journal export sweeper error", { error: (err as Error).message });
+  });
+}, 5 * 60_000);
+
+// Weekly synthesis — check every hour whether it's time to run (Sunday 22:00 UTC)
+setInterval(() => {
+  const now = new Date();
+  const isSunday = now.getUTCDay() === 0;
+  const isWeeklyHour = now.getUTCHours() === 22 && now.getUTCMinutes() < 5;
+  if (isSunday && isWeeklyHour) {
+    void runWeeklySynthesis().catch((err) => {
+      logger.warn("Weekly synthesis error", { error: (err as Error).message });
+    });
+  }
+}, 60 * 60_000);
 
 void ensureDefaultSchedules().catch((error) => {
   logger.error("Failed to ensure schedules", { error: (error as Error).message });

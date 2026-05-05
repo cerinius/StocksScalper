@@ -68,7 +68,7 @@ export const listAuditLogs = async (query: AuditListQuery): Promise<ListEnvelope
       take: query.pageSize,
     }),
     prisma.auditLog.count({ where }),
-    prisma.auditLog.count().then((count) => count > 0),
+    prisma.auditLog.count().then((count: number) => count > 0),
   ]);
 
   return buildListEnvelope({
@@ -105,7 +105,7 @@ export const auditSummary = async (hours: number) => {
   });
   return {
     since: since.toISOString(),
-    totals: rows.map((row) => ({
+    totals: rows.map((row: any) => ({
       category: row.category,
       severity: row.severity,
       count: row._count._all,

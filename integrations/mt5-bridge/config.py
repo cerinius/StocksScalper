@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     mt5_timeout_ms: int = 60000
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    bridge_auth_token: str
+    command_id_ttl_seconds: int = 86400
+    command_id_cache_max_entries: int = 5000
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",

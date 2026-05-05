@@ -7,7 +7,7 @@ export const getBacktestReport = async (limit = 250) => {
     take: limit,
   });
 
-  const candidateSummary = candidates.map((c) => ({
+  const candidateSummary = candidates.map((c: any) => ({
     id: c.id,
     symbol: c.symbol.ticker,
     timeframe: c.timeframe,
@@ -40,21 +40,21 @@ export const getDashboardOverview = async () => {
     generatedAt: new Date().toISOString(),
     account: accountSnapshot,
     activeTrades,
-    openPositions: openPositions.map((position) => ({
+    openPositions: openPositions.map((position: any) => ({
       symbol: position.symbol.ticker,
       direction: position.direction,
       quantity: position.quantity,
       exposurePct: position.exposurePct,
       unrealizedPnl: position.unrealizedPnl,
     })),
-    recentDecisions: recentDecisions.map((d) => ({
+    recentDecisions: recentDecisions.map((d: any) => ({
       id: d.id,
       action: d.action,
       status: d.status,
       confidence: d.confidence,
       createdAt: d.createdAt,
     })),
-    recentTrades: recentTrades.map((trade) => ({
+    recentTrades: recentTrades.map((trade: any) => ({
       id: trade.id,
       symbol: trade.symbol.ticker,
       direction: trade.direction,

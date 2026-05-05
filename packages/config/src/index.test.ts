@@ -15,7 +15,7 @@ describe("platform config", () => {
     expect(config.risk.maxEntrySpreadPct).toBe(0.08);
     expect(config.risk.correlationBlockThreshold).toBe(0.85);
     expect(config.risk.monteCarloSimulations).toBe(2000);
-    expect(config.marketDataProvider).toBe("mock");
+    expect(config.marketDataProvider).toBe("yahoo_finance");
     expect(config.marketData.massive.restBaseUrl).toBe("https://api.polygon.io");
     expect(config.watchlistSymbols).toContain("BTCUSD");
     expect(config.watchlistSymbols.length).toBeGreaterThan(3);

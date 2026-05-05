@@ -22,6 +22,17 @@ interface DashboardData {
   workerHealth: Array<{ workerType: string; status: string; currentTask: string | null; lastSeenAt: string }>;
   killSwitchActive: boolean;
   dynamicMaxRiskPerTradePct: number | null;
+  bridgeSummary: {
+    accounts: number;
+    connected: number;
+    degraded: number;
+    stale: number;
+    disconnected: number;
+    error: number;
+    blockNewOrders: number;
+    blockedAccounts: string[];
+    latestCapturedAt: string | null;
+  };
   activeWatchlist: {
     id: string;
     name: string;
@@ -33,6 +44,7 @@ interface DashboardData {
 
 export default function DashboardPage() {
   const { data } = useSWR<DashboardData>("/api/dashboard/summary", fetcher, { refreshInterval: 5000 });
+  const bridgeBlocked = (data?.bridgeSummary.blockNewOrders ?? 0) > 0;
 
   return (
     <>
@@ -41,6 +53,17 @@ export default function DashboardPage() {
         title="Trading intelligence command center"
         description="Monitor account state, worker health, risk pressure, and the latest platform actions from one place."
       />
+
+      {bridgeBlocked ? (
+        <div className="alert-banner tone-critical">
+          <strong>Bridge risk: new order placement is blocked on {data?.bridgeSummary.blockNewOrders} account(s).</strong>
+          <span>
+            {data?.bridgeSummary.blockedAccounts.slice(0, 4).join(", ")}
+            {((data?.bridgeSummary.blockedAccounts.length ?? 0) > 4) ? " ..." : ""}
+          </span>
+          <Link href="/bridge">Open bridge health</Link>
+        </div>
+      ) : null}
 
       <div className="metrics-grid">
         <MetricCard label="Balance" value={formatMoney(data?.account?.balance)} />
@@ -52,6 +75,7 @@ export default function DashboardPage() {
         <MetricCard label="Active Trades" value={data?.activeTrades ?? 0} />
         <MetricCard label="Kill Switch" value={data?.killSwitchActive ? "Active" : "Clear"} tone={data?.killSwitchActive ? "critical" : "good"} />
         <MetricCard label="Risk / Trade" value={data?.dynamicMaxRiskPerTradePct ? `${data.dynamicMaxRiskPerTradePct.toFixed(2)}%` : "Base"} tone={(data?.dynamicMaxRiskPerTradePct ?? 0.75) < 0.75 ? "warn" : "default"} />
+        <MetricCard label="Bridge Blocked" value={data?.bridgeSummary.blockNewOrders ?? 0} tone={(data?.bridgeSummary.blockNewOrders ?? 0) > 0 ? "critical" : "good"} />
       </div>
 
       <div className="panel-grid">

@@ -21,7 +21,7 @@ export const getPortfolioOverview = async () => {
     }),
   ]);
 
-  const exposureBySymbol = openPositions.map((position) => ({
+  const exposureBySymbol = openPositions.map((position: any) => ({
     symbol: position.symbol.ticker,
     exposurePct: position.exposurePct,
     direction: position.direction,
