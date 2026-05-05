@@ -1,6 +1,6 @@
 import type { AccountSnapshotExtended, AccountRuleProfile, PreTradeCriticOutput, TradeCandidateRecord, ValidationMetrics } from "@stock-radar/types";
 import { preTradeCriticOutputSchema } from "@stock-radar/types";
-import { OllamaClient } from "../client";
+import { getAIRouter } from "../router";
 import { filterPreTradeCritique } from "../safety";
 
 export interface PreTradeCritiqueInputs {
@@ -25,9 +25,9 @@ export const PRETRADE_PROMPT_VERSION = "pretrade-critic@1.0.0";
 
 export const runOllamaPreTradeCritique = async (
   inputs: PreTradeCritiqueInputs,
-  client = new OllamaClient(),
 ) => {
-  const result = await client.generateJson({
+  const router = getAIRouter();
+  const result = await router.generateJson({
     schema: preTradeCriticOutputSchema,
     system: [
       "You are a conservative funded-trading risk critic.",
@@ -35,9 +35,15 @@ export const runOllamaPreTradeCritique = async (
       "Return compact JSON only. Prefer ABSTAIN-like neutral feedback when evidence is weak.",
     ].join(" "),
     prompt: buildPrompt(inputs),
-    timeoutMs: Number(process.env.OLLAMA_PRETRADE_TIMEOUT_MS ?? 6_000),
+    // Use AI_PRETRADE_TIMEOUT_MS for cloud providers (they need more time).
+    // Falls back to legacy OLLAMA_PRETRADE_TIMEOUT_MS for backward compat.
+    timeoutMs: Number(
+      process.env.AI_PRETRADE_TIMEOUT_MS ??
+      process.env.OLLAMA_PRETRADE_TIMEOUT_MS ??
+      20_000,
+    ),
     temperature: 0.2,
-  });
+  }, "pretrade");
 
   const filtered = filterPreTradeCritique(result.output as PreTradeCriticOutput);
   return {
